@@ -560,8 +560,83 @@ corten-matrix carddav-setup \
 Quote the password so your shell passes it through intact. The command discovers the CardDAV URL (unless `--url` is given), verifies the credentials, encrypts the password, and prints JSON containing `url`, `username` and `password_encrypted` — copy those into the `carddav.*` keys in your `config.yaml`, then `corten-matrix restart`. `--username` defaults to the email address if omitted.
 | `backfill.max_initial_messages` | `2147483647` | Cap on messages per chat for the initial backfill (`2147483647` = uncapped). Setup writes this when CloudKit backfill is enabled — uncapped by default, or the per-chat limit (≥100) you pick on first install. |
 | `encryption.allow` | `false` | bridgev2 framework option. Set `true` to enable end-to-bridge encryption. |
+| `encryption.msc4190` | `false` | bridgev2 framework option. Required when your homeserver uses [Matrix Authentication Service](#matrix-authentication-service-mas--next-gen-auth). Setup enables it automatically when MAS is detected. |
 | `database.type` | `sqlite3-fk-wal` | bridgev2 framework option. Setup asks during first run and defaults to SQLite. **SQLite is the only supported database** — it is what the bridge is developed and tested against. `postgres` is accepted by the framework but unsupported here: it gets no testing, and problems specific to it are yours to diagnose. |
 | `debug_disable_privacy` | `false` | **Development only — leave `false` in any real deployment.** Turns off log anonymization and the message-body scrubber, and re-fills previously-scrubbed plaintext on the next CloudKit sync. See [Privacy](#privacy). Does not undo deletes/unsends and does not re-deliver anything to Matrix. |
+
+### Matrix Authentication Service (MAS / next-gen auth)
+
+If your homeserver delegates authentication to [Matrix Authentication Service](https://element-hq.github.io/matrix-authentication-service/)
+(MSC3861), it stops serving `/login` entirely. The bridge's own appservice token is unaffected — Synapse
+checks appservice tokens before it introspects anything with MAS — but the framework's legacy way of
+creating the bridge bot's encryption device (`m.login.application_service`) no longer exists, so an
+encrypted bridge dies at startup with:
+
+```
+failed to start Matrix connector: homeserver does not support appservice login
+```
+
+The replacement is [MSC4190](https://github.com/matrix-org/matrix-spec-proposals/pull/4190), which
+creates the device with `PUT /_matrix/client/v3/devices/{deviceID}` using the appservice token. mautrix
+implements it already; it just has to be switched on in **two** places:
+
+1. `config.yaml`:
+
+   ```yaml
+   encryption:
+       msc4190: true
+   ```
+
+2. The appservice registration file your **homeserver** reads (the one listed in
+   `app_service_config_files`), at the top level:
+
+   ```yaml
+   io.element.msc4190: true
+   ```
+
+   Then restart the homeserver. Synapse still reads exactly this key; the old
+   `msc3202_device_masquerading` experimental feature is no longer needed (device masquerading is
+   unconditional since Synapse 1.141).
+
+`scripts/install.sh` probes for MAS during setup and sets both flags for you, and the bridge re-checks on
+every start — if it finds MAS with `encryption.allow: true` but `msc4190` off, it enables `msc4190` in
+`config.yaml` itself and prints a reminder about the registration file. You can set both flags before
+migrating to MAS; MSC4190 works on a homeserver that hasn't migrated yet.
+
+> **Don't run `corten-matrix -c config.yaml -g` to add the flag.** Generating a registration mints a new
+> `as_token`, `hs_token` and `sender_localpart`, which orphans the appservice your homeserver already
+> knows about. Add the one line to the existing registration by hand.
+
+#### Double puppeting under MAS
+
+Shared-secret login is gone from the bridgev2 framework, and MAS-issued user tokens expire, so the only
+supported automatic method is a second appservice. On the homeserver, create `doublepuppet.yaml`:
+
+```yaml
+id: doublepuppet
+url:                      # intentionally null — nothing is pushed to this appservice
+as_token: <random string>
+hs_token: <random string>
+sender_localpart: <random string>
+rate_limited: false
+namespaces:
+  users:
+  - regex: '@.*:your\.domain'
+    exclusive: false      # must be false, or it takes over every local user
+```
+
+Add it to `app_service_config_files` alongside the bridge's own registration, restart the homeserver, and
+point the bridge at its token:
+
+```yaml
+double_puppet:
+    secrets:
+        your.domain: "as_token:<the as_token from doublepuppet.yaml>"
+```
+
+This works under MAS for the same reason the bridge's own token does, and one such registration can be
+reused by every bridge on the server. See the
+[upstream double puppeting docs](https://docs.mau.fi/bridges/general/double-puppeting.html) for details.
 
 ## Build from source (macOS)
 

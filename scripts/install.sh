@@ -312,6 +312,75 @@ else
     echo "✓ Generated registration"
 fi
 
+# ── Matrix Authentication Service (next-gen auth) ─────────────
+# A homeserver that delegates auth to MAS no longer serves appservice login, so
+# the bridge bot device has to be created with MSC4190 instead. mautrix already
+# implements that, but only when BOTH encryption.msc4190 is set in the config and
+# io.element.msc4190 is set in the registration the homeserver reads. Without
+# them an encrypted bridge dies at startup with the opaque error
+# "homeserver does not support appservice login".
+#
+# The MSC2965 metadata document only exists when auth is delegated, so it is a
+# reliable probe. The flags are harmless on a homeserver that hasn't migrated
+# yet (upstream recommends setting msc4190 ahead of a migration), but we only
+# touch anything when the probe actually succeeds, so a network blip can never
+# rewrite a working config.
+MAS_DETECTED=false
+HS_ADDRESS_CHECK=$(python3 -c "
+import re
+m = re.search(r'^\s+address:\s*(\S+)', open('$CONFIG').read(), re.MULTILINE)
+print(m.group(1) if m else '')
+")
+if [ -n "$HS_ADDRESS_CHECK" ] && curl -fsS -m 15 -o /dev/null \
+        "${HS_ADDRESS_CHECK%/}/_matrix/client/v1/auth_metadata" 2>/dev/null; then
+    MAS_DETECTED=true
+    if MAS_PATCHED=$(python3 -c "
+import os, re
+
+def set_or_insert(path, key, indent, anchor):
+    '''Set 'key: true' in path, inserting it under anchor if absent. Only the
+    one value is ever rewritten -- indentation and any trailing comment are
+    preserved, and nothing else in the file is reflowed.'''
+    text = open(path).read()
+    pattern = r'^(' + re.escape(indent) + re.escape(key) + r'[ \t]*:)([^\n#]*)'
+
+    def repl(m):
+        tail = m.group(2)
+        gap = tail[len(tail.rstrip(' \t')):]
+        return m.group(1) + ' true' + gap
+
+    if re.search(pattern, text, re.MULTILINE):
+        new = re.sub(pattern, repl, text, count=1, flags=re.MULTILINE)
+    elif anchor is None:
+        new = text if text.endswith('\n') else text + '\n'
+        new += indent + key + ': true\n'
+    else:
+        new, n = re.subn(r'^(' + re.escape(anchor) + r'[ \t]*)$',
+                         r'\1\n' + indent + key + ': true',
+                         text, count=1, flags=re.MULTILINE)
+        if n == 0:
+            return False
+    if new != text:
+        open(path, 'w').write(new)
+        return True
+    return False
+
+changed = set_or_insert('$CONFIG', 'msc4190', '    ', 'encryption:')
+if os.path.exists('$REGISTRATION'):
+    changed |= set_or_insert('$REGISTRATION', 'io.element.msc4190', '', None)
+print('changed' if changed else 'unchanged')
+"); then
+        echo "✓ Homeserver uses Matrix Authentication Service — MSC4190 enabled in config and registration"
+        if [ "$MAS_PATCHED" = "changed" ]; then
+            echo "  Restart your homeserver so it picks up io.element.msc4190 in the registration."
+        fi
+    else
+        echo "⚠ Homeserver uses Matrix Authentication Service, but the MSC4190 flags could not be"
+        echo "  set automatically. Set encryption.msc4190: true in $CONFIG and"
+        echo "  io.element.msc4190: true in the appservice registration, then restart the homeserver."
+    fi
+fi
+
 # ── Register with homeserver (first run only) ─────────────────
 if [ "$FIRST_RUN" = true ]; then
     REG_PATH="$(cd "$DATA_DIR" && pwd)/registration.yaml"
@@ -326,6 +395,15 @@ if [ "$FIRST_RUN" = true ]; then
     echo "│  Then restart your homeserver.              │"
     echo "└─────────────────────────────────────────────┘"
     echo ""
+    if [ "$MAS_DETECTED" = true ]; then
+        echo "Your homeserver uses Matrix Authentication Service, so the registration above"
+        echo "carries io.element.msc4190: true — the homeserver restart is what makes it take"
+        echo "effect. Without it the bridge cannot create its bot device."
+        echo ""
+        echo "Double puppeting also needs an appservice under MAS (shared-secret login is gone)."
+        echo "See the \"Matrix Authentication Service\" section of the README."
+        echo ""
+    fi
     read -p "Press Enter once your homeserver is restarted..."
 fi
 

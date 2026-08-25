@@ -85,3 +85,12 @@ ours. To change a framework default, override it in `IMConnector.Start()`
 `phone_numbers_in_profile` (must be true or bridgev2 strips `tel:` from contact
 profiles → no call button), `unknown_error_auto_reconnect`, and
 `unknown_error_max_auto_reconnects`.
+
+One documented exception to "framework config is not ours": `encryption.msc4190`.
+A homeserver that moves to Matrix Authentication Service stops serving appservice
+login, which kills an encrypted bridge at startup with the unhelpful "homeserver
+does not support appservice login". `ensureMASCompatibility`
+(`cmd/corten-matrix/ensure_config.go`, called from `main()` after `PreInit`)
+probes for MAS and sets that flag both in memory and in `config.yaml`. It cannot
+set the matching `io.element.msc4190` in the homeserver's registration file, so
+it prints what the operator still has to do. See the MAS section of the README.

@@ -9,12 +9,18 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
+	"maunium.net/go/mautrix/bridgev2/matrix/mxmain"
 
 	"github.com/lrhodin/corten-matrix/pkg/imconfig"
 )
@@ -220,4 +226,166 @@ func atomicWriteConfig(path string, data []byte) error {
 		return err
 	}
 	return nil
+}
+
+// masAuthMetadataPath is the MSC2965 authentication metadata document. Synapse
+// only serves it when authentication is delegated to Matrix Authentication
+// Service (next-gen auth / MSC3861), which makes it a reliable MAS probe.
+const masAuthMetadataPath = "/_matrix/client/v1/auth_metadata"
+
+// ensureMASCompatibility turns on encryption.msc4190 when the homeserver has
+// moved to next-gen auth (Matrix Authentication Service).
+//
+// Under MAS, Synapse stops serving /login altogether, so the framework's legacy
+// bridge-bot device creation (m.login.application_service) fails and the bridge
+// dies with "homeserver does not support appservice login" on every start.
+// mautrix already ships the replacement — MSC4190's
+// PUT /_matrix/client/v3/devices/{deviceID} — but only behind
+// encryption.msc4190, which nothing in our setup flow used to set. So a working
+// bridge breaks the moment the operator migrates their homeserver to MAS, with
+// an error that doesn't say what to change.
+//
+// Detection is one GET of the MSC2965 metadata document. Anything other than a
+// 200 — including any network error — is treated as "not MAS" and leaves the
+// config completely untouched: a probe must never be able to block startup.
+//
+// Same conservative rules as ensureNetworkConfigKeys: a config that doesn't
+// parse is left alone, the YAML tree is never re-serialized (only the one
+// scalar line is rewritten, so comments and formatting survive), the write is
+// atomic, and it is idempotent.
+//
+// The matching homeserver-side flag (io.element.msc4190: true in the appservice
+// registration) lives on the homeserver and can't be set from here, so we print
+// what the operator still has to do.
+func ensureMASCompatibility(br *mxmain.BridgeMain) {
+	if br.Config == nil || !br.Config.Encryption.Allow || br.Config.Encryption.MSC4190 {
+		return
+	}
+	if !homeserverUsesMAS(br.Config.Homeserver.Address) {
+		return
+	}
+
+	// Apply in memory too, so the fix takes effect on this run and not only
+	// after the next restart.
+	br.Config.Encryption.MSC4190 = true
+	fmt.Fprintf(os.Stderr, "Homeserver uses Matrix Authentication Service (next-gen auth) — "+
+		"enabled encryption.msc4190 so the bridge bot device is created via MSC4190 "+
+		"instead of appservice login\n")
+	if br.ConfigPath != "" {
+		if err := setMSC4190OnDisk(br.ConfigPath); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not persist encryption.msc4190 to %s: %v\n",
+				br.ConfigPath, err)
+		}
+	}
+	fmt.Fprintf(os.Stderr, "ACTION REQUIRED: add `io.element.msc4190: true` to this bridge's appservice "+
+		"registration on the homeserver and restart the homeserver, otherwise creating the bot "+
+		"device will fail. See https://docs.mau.fi/bridges/general/end-to-bridge-encryption.html\n")
+}
+
+// homeserverUsesMAS reports whether the homeserver delegates authentication to
+// Matrix Authentication Service. Errors mean "unknown", which is reported as
+// false so a transient network problem can never flip the config.
+func homeserverUsesMAS(address string) bool {
+	if address == "" {
+		return false
+	}
+	base, err := url.Parse(address)
+	if err != nil || base.Host == "" {
+		return false
+	}
+	base.Path = strings.TrimSuffix(base.Path, "/") + masAuthMetadataPath
+	base.RawQuery = ""
+	base.Fragment = ""
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base.String(), nil)
+	if err != nil {
+		return false
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return resp.StatusCode == http.StatusOK
+}
+
+// setMSC4190OnDisk sets encryption.msc4190 to true in the config file, editing
+// only that one line (or splicing the key in if an older config predates it).
+// The parsed tree is used solely to locate the line and is never marshalled
+// back out.
+func setMSC4190OnDisk(configPath string) error {
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return err
+	}
+	var root yaml.Node
+	if err := yaml.Unmarshal(data, &root); err != nil {
+		return fmt.Errorf("config does not parse, leaving it untouched: %w", err)
+	}
+	if len(root.Content) == 0 || root.Content[0].Kind != yaml.MappingNode {
+		return fmt.Errorf("unexpected config structure")
+	}
+	encryption := mappingValue(root.Content[0], "encryption")
+	if encryption == nil || encryption.Kind != yaml.MappingNode || len(encryption.Content) == 0 {
+		return fmt.Errorf("no encryption block in config")
+	}
+	lines := strings.Split(string(data), "\n")
+
+	if node := mappingValue(encryption, "msc4190"); node != nil {
+		if node.Kind != yaml.ScalarNode {
+			return fmt.Errorf("encryption.msc4190 is not a scalar")
+		}
+		if node.Value == "true" {
+			return nil // already set on disk
+		}
+		if node.Line < 1 || node.Line > len(lines) {
+			return fmt.Errorf("encryption.msc4190 line %d out of range", node.Line)
+		}
+		updated, ok := setScalarInLine(lines[node.Line-1], "msc4190", "true")
+		if !ok {
+			return fmt.Errorf("could not rewrite line %d (%q)", node.Line, lines[node.Line-1])
+		}
+		lines[node.Line-1] = updated
+		return atomicWriteConfig(configPath, []byte(strings.Join(lines, "\n")))
+	}
+
+	// Key absent (config predates the framework option, e.g. when the bridge
+	// runs with --no-update): splice it in as the encryption block's first key,
+	// matching that block's existing indentation.
+	indent := strings.Repeat(" ", encryption.Content[0].Column-1)
+	after := encryption.Content[0].Line - 1 // insert above the first existing key
+	if after < 1 || after > len(lines) {
+		return fmt.Errorf("encryption block line %d out of range", encryption.Content[0].Line)
+	}
+	out := make([]string, 0, len(lines)+1)
+	out = append(out, lines[:after]...)
+	out = append(out, indent+"msc4190: true")
+	out = append(out, lines[after:]...)
+	return atomicWriteConfig(configPath, []byte(strings.Join(out, "\n")))
+}
+
+// setScalarInLine replaces the value of a `key: value` config line. Everything
+// around the value — indentation, the spacing after the colon, and any trailing
+// comment together with the whitespace in front of it — is preserved byte for
+// byte, so rewriting a value never reflows the file.
+func setScalarInLine(line, key, value string) (string, bool) {
+	idx := strings.Index(line, key+":")
+	if idx < 0 || strings.TrimSpace(line[:idx]) != "" {
+		return "", false
+	}
+	rest := line[idx+len(key)+1:]
+	lead := rest[:len(rest)-len(strings.TrimLeft(rest, " \t"))]
+	if lead == "" {
+		lead = " "
+	}
+	gap, comment := "", ""
+	if c := strings.Index(rest, "#"); c >= 0 {
+		beforeComment := rest[:c]
+		gap = beforeComment[len(strings.TrimRight(beforeComment, " \t")):]
+		comment = rest[c:]
+	}
+	return line[:idx] + key + ":" + lead + value + gap + comment, true
 }
