@@ -3,6 +3,9 @@
 package connector
 
 import (
+	"sync"
+	"time"
+
 	"github.com/rs/zerolog"
 
 	"github.com/lrhodin/corten-matrix/imessage"
@@ -12,8 +15,11 @@ import (
 // localContactSource wraps the macOS Contacts framework as a contactSource.
 // Used when backfill_source=chatdb (no iCloud, local-only).
 type localContactSource struct {
-	store    *mac.ContactStore
+	store *mac.ContactStore
+
+	mu       sync.RWMutex
 	contacts []*imessage.Contact
+	lastSync time.Time
 }
 
 func newLocalContactSource(log zerolog.Logger) contactSource {
@@ -35,9 +41,22 @@ func (l *localContactSource) SyncContacts(log zerolog.Logger) error {
 	if err != nil {
 		return err
 	}
+	l.mu.Lock()
 	l.contacts = contacts
+	l.lastSync = time.Now()
+	l.mu.Unlock()
 	log.Info().Int("count", len(contacts)).Msg("Loaded local macOS contacts")
 	return nil
+}
+
+// CacheStatus implements contactSource. Lookups go straight to the macOS
+// Contacts framework rather than a local map, so the count is only used to
+// report how much the last load saw; a non-zero lastSync means the store is
+// usable.
+func (l *localContactSource) CacheStatus() (int, time.Time) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return len(l.contacts), l.lastSync
 }
 
 func (l *localContactSource) GetContactInfo(identifier string) (*imessage.Contact, error) {
@@ -45,5 +64,7 @@ func (l *localContactSource) GetContactInfo(identifier string) (*imessage.Contac
 }
 
 func (l *localContactSource) GetAllContacts() []*imessage.Contact {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
 	return l.contacts
 }

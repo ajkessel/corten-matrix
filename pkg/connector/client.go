@@ -216,8 +216,11 @@ type IMClient struct {
 	// iCloud token provider (auth for CardDAV, CloudKit, etc.)
 	tokenProvider **rustpushgo.WrappedTokenProvider
 
-	// Contact source for name resolution (iCloud or external CardDAV)
-	contacts contactSource
+	// Contact source for name resolution (iCloud or external CardDAV).
+	// Reassigned by retryCloudContacts while message handling reads it, so all
+	// access goes through contactStore()/setContactStore().
+	contacts   contactSource
+	contactsMu sync.RWMutex
 
 	// sharedProfiles is the in-memory cache of shared iMessage profile records
 	// (Name & Photo Sharing) received via ShareProfile / UpdateProfile
@@ -1539,9 +1542,9 @@ func (c *IMClient) Connect(ctx context.Context) {
 	if c.Main.Config.CardDAV.IsConfigured() {
 		extContacts := newExternalCardDAVClient(c.Main.Config.CardDAV, log)
 		if extContacts != nil {
-			c.contacts = extContacts
+			c.setContactStore(extContacts)
 			log.Info().Str("email", logSafeHandle(c.Main.Config.CardDAV.Email)).Msg("Using external CardDAV for contacts")
-			if syncErr := c.contacts.SyncContacts(log); syncErr != nil {
+			if syncErr := extContacts.SyncContacts(log); syncErr != nil {
 				log.Warn().Err(syncErr).Msg("Initial external CardDAV sync failed")
 			} else {
 				c.setContactsReady(log)
@@ -1552,9 +1555,10 @@ func (c *IMClient) Connect(ctx context.Context) {
 		}
 	} else if c.Main.Config.UseChatDBBackfill() {
 		// Chat.db mode: use local macOS Contacts (no iCloud dependency).
-		c.contacts = newLocalContactSource(log)
-		if c.contacts != nil {
-			if syncErr := c.contacts.SyncContacts(log); syncErr != nil {
+		localContacts := newLocalContactSource(log)
+		if localContacts != nil {
+			c.setContactStore(localContacts)
+			if syncErr := localContacts.SyncContacts(log); syncErr != nil {
 				log.Warn().Err(syncErr).Msg("Initial local contacts sync failed")
 			} else {
 				c.setContactsReady(log)
@@ -1565,7 +1569,7 @@ func (c *IMClient) Connect(ctx context.Context) {
 	} else {
 		cloudContacts := newCloudContactsClient(c.client, log)
 		if cloudContacts != nil {
-			c.contacts = cloudContacts
+			c.setContactStore(cloudContacts)
 			log.Info().Str("url_host", logSafeURL(cloudContacts.baseURL)).Msg("Cloud contacts available (iCloud CardDAV)")
 			if syncErr := cloudContacts.SyncContacts(log); syncErr != nil {
 				log.Warn().Err(syncErr).Msg("Initial CardDAV sync failed")
@@ -2481,11 +2485,12 @@ func (c *IMClient) dmFocusName(ctx context.Context, portal *bridgev2.Portal) *st
 // reason; the moon stamp sites must do the same. Mirrors GetUserInfo's
 // contact-avatar block (same AvatarID format → idempotent with the ghost's).
 func (c *IMClient) dmFocusContactAvatar(ctx context.Context, portal *bridgev2.Portal) *bridgev2.Avatar {
-	if c.contacts == nil {
+	store := c.contactStore()
+	if store == nil {
 		return nil
 	}
 	portalID := string(portal.ID)
-	contact, _ := c.contacts.GetContactInfo(stripIdentifierPrefix(portalID))
+	contact, _ := store.GetContactInfo(stripIdentifierPrefix(portalID))
 	if contact == nil || len(contact.Avatar) == 0 {
 		return nil
 	}
@@ -7760,13 +7765,17 @@ func (c *IMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*b
 		// framework, which blocks UpdateInfoFromGhost (it returns early when
 		// NameIsCustom is set), so we must also set the avatar explicitly here.
 		if isSelfChat {
-			selfName := c.resolveContactDisplayname(portalID)
-			chatInfo.Name = &selfName
+			// "" means the address book is degraded and we have no better
+			// answer than the raw handle — leave the existing title rather than
+			// stamping a downgrade that the next good sync would flip back.
+			if selfName := c.resolveContactDisplayname(portalID); selfName != "" {
+				chatInfo.Name = &selfName
+			}
 
 			// Pull contact photo for self-chat room avatar.
 			localID := stripIdentifierPrefix(portalID)
-			if c.contacts != nil {
-				if contact, _ := c.contacts.GetContactInfo(localID); contact != nil && len(contact.Avatar) > 0 {
+			if store := c.contactStore(); store != nil {
+				if contact, _ := store.GetContactInfo(localID); contact != nil && len(contact.Avatar) > 0 {
 					avatarHash := sha256.Sum256(contact.Avatar)
 					avatarData := contact.Avatar
 					chatInfo.Avatar = &bridgev2.Avatar{
@@ -7824,12 +7833,16 @@ func (c *IMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*b
 }
 
 // resolveContactDisplayname returns a contact-resolved display name for the
-// given identifier (e.g. "tel:+1234567890"). Falls back to formatting the
-// raw identifier if no contact is found.
+// given identifier (e.g. "tel:+1234567890"). Falls back to formatting the raw
+// identifier if no contact is found — EXCEPT while the address book is
+// degraded (see contactsDegraded), where it returns "" to mean "no answer yet".
+// Callers already treat "" as "leave the current name alone" (dmFocusName,
+// computeDMTitle), which keeps a self-chat or DM title from flipping to a raw
+// handle and back when a contact sync fails.
 func (c *IMClient) resolveContactDisplayname(identifier string) string {
 	localID := stripIdentifierPrefix(identifier)
-	if c.contacts != nil {
-		contact, contactErr := c.contacts.GetContactInfo(localID)
+	if store := c.contactStore(); store != nil {
+		contact, contactErr := store.GetContactInfo(localID)
 		if contactErr != nil {
 			c.Main.Bridge.Log.Debug().Err(contactErr).Str("id", localID).Msg("Failed to resolve contact info")
 		}
@@ -7841,6 +7854,9 @@ func (c *IMClient) resolveContactDisplayname(identifier string) string {
 				ID:        localID,
 			})
 		}
+	}
+	if c.contactsDegraded() {
+		return ""
 	}
 	return c.Main.Config.FormatDisplayname(identifierToDisplaynameParams(identifier))
 }
@@ -7860,16 +7876,16 @@ func (c *IMClient) GetUserInfo(ctx context.Context, ghost *bridgev2.Ghost) (*bri
 	// Try contact info from cloud contacts (iCloud CardDAV)
 	localID := stripIdentifierPrefix(identifier)
 	var contact *imessage.Contact
-	if c.contacts != nil {
+	if store := c.contactStore(); store != nil {
 		var contactErr error
-		contact, contactErr = c.contacts.GetContactInfo(localID)
+		contact, contactErr = store.GetContactInfo(localID)
 		if contactErr != nil {
 			zerolog.Ctx(ctx).Debug().Err(contactErr).Str("id", localID).Msg("Failed to resolve contact info")
 		}
 	}
 
 	// User-provided contacts (CardDAV / iCloud) always win. Any match from
-	// c.contacts fully overrides the shared iMessage profile, regardless of
+	// the contact store fully overrides the shared iMessage profile, regardless of
 	// whether the contact has a name or photo: the user adding an entry is
 	// itself the signal that they want their own data used. Shared profiles
 	// only fill the gap when the identifier is unknown to the address book.
@@ -7952,7 +7968,11 @@ func (c *IMClient) GetUserInfo(ctx context.Context, ghost *bridgev2.Ghost) (*bri
 				Get: func(ctx context.Context) ([]byte, error) {
 					// Re-read under the cache lock for the freshest bytes and to
 					// avoid racing the download goroutines that write Avatar.
-					if fresh, _ := c.contacts.GetContactInfo(localID); fresh != nil && len(fresh.Avatar) > 0 {
+					store := c.contactStore()
+					if store == nil {
+						return nil, fmt.Errorf("contact store unavailable")
+					}
+					if fresh, _ := store.GetContactInfo(localID); fresh != nil && len(fresh.Avatar) > 0 {
 						return fresh.Avatar, nil
 					}
 					return nil, fmt.Errorf("contact photo pending download")
@@ -7988,7 +8008,23 @@ func (c *IMClient) GetUserInfo(ctx context.Context, ghost *bridgev2.Ghost) (*bri
 		}
 	}
 
-	// Final fallback: format from identifier
+	// Final fallback: format from identifier. Skip it entirely when the address
+	// book is degraded and this ghost ALREADY has a name — writing the raw
+	// handle over a resolved contact name is the display-name flip-flop, and it
+	// fans a member event into every room the ghost shares. Returning nil (not
+	// a UserInfo with Name==nil) leaves the avatar alone too: bridgev2 treats a
+	// nil Avatar inside a non-nil UserInfo as "never expecting one" and latches
+	// AvatarSet on an empty MXC, which would freeze the contact photo (same
+	// trap as the AvatarURL branch above). UpdateInfoIfNecessary handles a nil
+	// return as "no info received" and writes nothing.
+	//
+	// A ghost with no name yet still gets the fallback: a readable phone/email
+	// beats rendering as a raw @corten_tel=3a... MXID in clients and pushes.
+	if ghost.Name != "" && c.contactsDegraded() {
+		zerolog.Ctx(ctx).Debug().Str("ghost_id", string(ghost.ID)).
+			Msg("Contact cache unavailable — keeping existing ghost profile instead of falling back to the raw identifier")
+		return nil, nil
+	}
 	name := c.Main.Config.FormatDisplayname(identifierToDisplaynameParams(identifier))
 	ui.Name = &name
 	return ui, nil
@@ -10312,7 +10348,13 @@ func (c *IMClient) periodicCloudContactSync(log zerolog.Logger) {
 	for {
 		select {
 		case <-timer.C:
-			if err := c.contacts.SyncContacts(log); err != nil {
+			store := c.contactStore()
+			if store == nil {
+				// No source installed. Can't normally happen (this loop is only
+				// started after one is), so don't skip the shared-profile
+				// refresh below over it.
+				log.Warn().Msg("Periodic contact sync: no contact source installed")
+			} else if err := store.SyncContacts(log); err != nil {
 				failures++
 				interval = contactSyncBackoff(base, max, failures)
 				ev := log.Warn().Err(err).Int("failures", failures).Dur("next_in", interval)
@@ -10381,6 +10423,48 @@ func (c *IMClient) persistMmeDelegate(log zerolog.Logger) {
 	}
 }
 
+// contactStore returns the installed contact source, or nil when none is
+// configured (no CardDAV credentials, or the iCloud delegate never came up).
+func (c *IMClient) contactStore() contactSource {
+	c.contactsMu.RLock()
+	defer c.contactsMu.RUnlock()
+	return c.contacts
+}
+
+// setContactStore installs a contact source. Callers must only pass a non-nil
+// concrete value — see the comment in retryCloudContacts for why a typed nil
+// pointer is worse than no store at all.
+func (c *IMClient) setContactStore(store contactSource) {
+	c.contactsMu.Lock()
+	c.contacts = store
+	c.contactsMu.Unlock()
+}
+
+// contactsDegraded reports whether a contact source is configured but its cache
+// is not yet trustworthy — i.e. no sync has populated it. Name resolution uses
+// this to hold an already-resolved display name instead of downgrading it to a
+// raw phone/email, which is what produced the "real name ↔ Apple ID" flip-flop:
+// a transient CardDAV error emptied the cache, the next inbound message
+// re-resolved the sender from the identifier, and every shared room got a
+// spurious "changed their display name" member event until the following sync
+// put it back.
+//
+// Note the two cases this deliberately does NOT treat as degraded:
+//   - no source configured at all (nil): the identifier fallback IS the answer,
+//     and there is no later sync coming to improve on it.
+//   - a completed sync that found zero contacts: with the replace guard in
+//     SyncContacts (checkContactCacheReplace) a failed fetch can no longer land
+//     an empty cache, so an empty-but-synced cache means a genuinely empty
+//     address book. Holding names forever on that would be wrong.
+func (c *IMClient) contactsDegraded() bool {
+	store := c.contactStore()
+	if store == nil {
+		return false
+	}
+	_, lastSync := store.CacheStatus()
+	return lastSync.IsZero()
+}
+
 // retryCloudContacts retries the cloud contacts initialization periodically
 // when it fails on startup (e.g., expired MobileMe delegate). Once contacts
 // succeed, the readiness gate opens and cloud sync begins.
@@ -10397,9 +10481,16 @@ func (c *IMClient) retryCloudContacts(log zerolog.Logger) {
 		select {
 		case <-timer.C:
 			log.Info().Msg("Retrying cloud contacts initialization...")
-			c.contacts = newCloudContactsClient(c.client, log)
-			if c.contacts != nil {
-				if syncErr := c.contacts.SyncContacts(log); syncErr != nil {
+			// Assign through a local and only install a NON-nil client:
+			// newCloudContactsClient returns a typed nil pointer on failure,
+			// and storing that in the contactSource interface makes every
+			// `store != nil` guard pass while lookups answer "no contact" (and
+			// SyncContacts nil-derefs). That silently downgrades every
+			// contact-resolved display name to a raw handle.
+			cloudContacts := newCloudContactsClient(c.client, log)
+			if cloudContacts != nil {
+				c.setContactStore(cloudContacts)
+				if syncErr := cloudContacts.SyncContacts(log); syncErr != nil {
 					failures++
 					interval = contactSyncBackoff(base, max, failures)
 					ev := log.Warn().Err(syncErr).Int("failures", failures).Dur("next_in", interval)
@@ -11794,9 +11885,9 @@ func (c *IMClient) buildGroupName(members []string) string {
 		lookupID := stripIdentifierPrefix(memberID)
 		name := ""
 		var contact *imessage.Contact
-		if c.contacts != nil {
+		if store := c.contactStore(); store != nil {
 			var contactErr error
-			contact, contactErr = c.contacts.GetContactInfo(lookupID)
+			contact, contactErr = store.GetContactInfo(lookupID)
 			if contactErr != nil {
 				c.Main.Bridge.Log.Debug().Err(contactErr).Str("id", lookupID).Msg("Failed to resolve contact info")
 			}
@@ -13515,13 +13606,17 @@ func (c *IMClient) chatDBInfoToBridgev2(info *imessage.ChatInfo, chatPortalID ne
 		// framework, which blocks UpdateInfoFromGhost (it returns early when
 		// NameIsCustom is set), so we must also set the avatar explicitly here.
 		if isSelfChat {
-			selfName := c.resolveContactDisplayname(portalID)
-			chatInfo.Name = &selfName
+			// "" means the address book is degraded and we have no better
+			// answer than the raw handle — leave the existing title rather than
+			// stamping a downgrade that the next good sync would flip back.
+			if selfName := c.resolveContactDisplayname(portalID); selfName != "" {
+				chatInfo.Name = &selfName
+			}
 
 			// Pull contact photo for self-chat room avatar.
 			localID := stripIdentifierPrefix(portalID)
-			if c.contacts != nil {
-				if contact, _ := c.contacts.GetContactInfo(localID); contact != nil && len(contact.Avatar) > 0 {
+			if store := c.contactStore(); store != nil {
+				if contact, _ := store.GetContactInfo(localID); contact != nil && len(contact.Avatar) > 0 {
 					avatarHash := sha256.Sum256(contact.Avatar)
 					avatarData := contact.Avatar
 					chatInfo.Avatar = &bridgev2.Avatar{

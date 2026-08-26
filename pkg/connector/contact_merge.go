@@ -166,8 +166,8 @@ func (c *IMClient) lookupContact(identifier string) *imessage.Contact {
 		return nil
 	}
 
-	if c.contacts != nil {
-		contact, _ := c.contacts.GetContactInfo(localID)
+	if store := c.contactStore(); store != nil {
+		contact, _ := store.GetContactInfo(localID)
 		if contact != nil {
 			return contact
 		}
