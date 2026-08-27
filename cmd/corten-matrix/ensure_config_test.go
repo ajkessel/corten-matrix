@@ -16,6 +16,7 @@ import (
 	"strings"
 	"testing"
 
+	"gopkg.in/yaml.v3"
 	"maunium.net/go/mautrix/bridgev2/bridgeconfig"
 	"maunium.net/go/mautrix/bridgev2/matrix/mxmain"
 )
@@ -49,13 +50,20 @@ func writeConfig(t *testing.T, body string) string {
 // probe can be exercised without touching a real homeserver.
 func masServer(t *testing.T, status int) string {
 	t.Helper()
+	return bodyServer(t, status, `{"issuer":"https://auth.example.com/"}`)
+}
+
+// bodyServer serves an arbitrary body at the auth-metadata path, for the
+// not-really-MAS cases (a proxy catch-all answering 200 with HTML, say).
+func bodyServer(t *testing.T, status int, body string) string {
+	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != masAuthMetadataPath {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
 		w.WriteHeader(status)
-		_, _ = w.Write([]byte(`{"issuer":"https://auth.example.com/"}`))
+		_, _ = w.Write([]byte(body))
 	}))
 	t.Cleanup(srv.Close)
 	return srv.URL
@@ -203,5 +211,98 @@ func TestSetScalarInLine(t *testing.T) {
 		if ok && got != tc.want {
 			t.Errorf("setScalarInLine(%q) = %q, want %q", tc.line, got, tc.want)
 		}
+	}
+}
+
+// A 200 that isn't an MSC2965 metadata document must not be read as MAS. The
+// realistic source is an intermediary answering 200 for unknown paths; treating
+// that as MAS would rewrite a working config.
+func TestHomeserverUsesMASRejectsNonMetadata200(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "html catch-all", body: "<!doctype html><title>Element</title>"},
+		{name: "empty body", body: ""},
+		{name: "json without issuer", body: `{"something_else":true}`},
+		{name: "json with empty issuer", body: `{"issuer":""}`},
+		{name: "json array", body: `[]`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if homeserverUsesMAS(bodyServer(t, http.StatusOK, tc.body)) {
+				t.Errorf("a 200 with body %q must not count as MAS", tc.body)
+			}
+		})
+	}
+	if !homeserverUsesMAS(bodyServer(t, http.StatusOK, `{"issuer":"https://auth.example.com/"}`)) {
+		t.Error("a real MSC2965 document must still count as MAS")
+	}
+}
+
+// A flow-style encryption block can't take a spliced line without corrupting
+// the file, so the splice path must refuse rather than write.
+func TestSetMSC4190OnDiskRefusesFlowStyleBlock(t *testing.T) {
+	for _, body := range []string{
+		"homeserver:\n    address: https://x\nencryption: {allow: true, default: true}\n",
+		"encryption: {\n    allow: true,\n}\n",
+	} {
+		path := writeConfig(t, body)
+		if err := setMSC4190OnDisk(path); err == nil {
+			t.Errorf("expected an error for a flow-style encryption block:\n%s", body)
+		}
+		data, _ := os.ReadFile(path)
+		if string(data) != body {
+			t.Errorf("flow-style config was modified:\n%s", data)
+		}
+	}
+}
+
+// Guards the trap that a line-number comparison can't catch this: yaml.v3
+// reports a block mapping's Line as its first key's line, so the splice path
+// must key off the style flag, not the line numbers.
+func TestSetMSC4190OnDiskSplicesTwoSpaceBlock(t *testing.T) {
+	path := writeConfig(t, "encryption:\n  allow: true\n  default: true\n")
+	if err := setMSC4190OnDisk(path); err != nil {
+		t.Fatalf("setMSC4190OnDisk: %v", err)
+	}
+	data, _ := os.ReadFile(path)
+	if want := "encryption:\n  msc4190: true\n  allow: true\n"; !strings.HasPrefix(string(data), want) {
+		t.Errorf("indentation was not derived from the block:\n%s", data)
+	}
+	var probe yaml.Node
+	if err := yaml.Unmarshal(data, &probe); err != nil {
+		t.Errorf("result does not parse: %v\n%s", err, data)
+	}
+}
+
+func TestInlineCommentIndex(t *testing.T) {
+	tests := []struct {
+		in   string
+		want int
+	}{
+		{in: " false  # note", want: 8},
+		{in: " false\t# note", want: 7},
+		{in: "# note", want: 0},
+		{in: " false", want: -1},
+		{in: ` "a#b"`, want: -1}, // # inside a value is not a comment
+		{in: ` a#b # real`, want: 5},
+	}
+	for _, tc := range tests {
+		if got := inlineCommentIndex(tc.in); got != tc.want {
+			t.Errorf("inlineCommentIndex(%q) = %d, want %d", tc.in, got, tc.want)
+		}
+	}
+}
+
+// setScalarInLine is only ever called for the boolean msc4190, but it reads as
+// general-purpose, so it should not corrupt a value containing a #.
+func TestSetScalarInLinePreservesHashInValue(t *testing.T) {
+	got, ok := setScalarInLine(`    pickle_key: "a#b"`, "pickle_key", "true")
+	if !ok {
+		t.Fatal("setScalarInLine returned not-ok")
+	}
+	if want := `    pickle_key: true`; got != want {
+		t.Errorf("setScalarInLine = %q, want %q", got, want)
 	}
 }

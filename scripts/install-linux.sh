@@ -260,69 +260,153 @@ fi
 # ── Matrix Authentication Service (next-gen auth) ─────────────
 # A homeserver that delegates auth to MAS no longer serves appservice login, so
 # the bridge bot device has to be created with MSC4190 instead. mautrix already
-# implements that, but only when BOTH encryption.msc4190 is set in the config and
-# io.element.msc4190 is set in the registration the homeserver reads. Without
-# them an encrypted bridge dies at startup with the opaque error
+# implements that, but only when encryption.msc4190 is set — without it an
+# encrypted bridge dies at startup with the opaque error
 # "homeserver does not support appservice login".
 #
+# io.element.msc4190 in the registration is also set here. Synapse 1.141+ allows
+# the MSC4190 device endpoints without that opt-in flag, so it is belt-and-braces
+# on current versions and required on older ones.
+#
 # The MSC2965 metadata document only exists when auth is delegated, so it is a
-# reliable probe. The flags are harmless on a homeserver that hasn't migrated
-# yet (upstream recommends setting msc4190 ahead of a migration), but we only
-# touch anything when the probe actually succeeds, so a network blip can never
-# rewrite a working config.
+# reliable probe — but only if the body really is that document: an intermediary
+# answering 200 for unknown paths would otherwise read as MAS. Nothing is touched
+# unless the probe succeeds, so a network blip can never rewrite a working config.
 MAS_DETECTED=false
 HS_ADDRESS_CHECK=$(python3 -c "
 import re
 m = re.search(r'^\s+address:\s*(\S+)', open('$CONFIG').read(), re.MULTILINE)
 print(m.group(1) if m else '')
 ")
-if [ -n "$HS_ADDRESS_CHECK" ] && curl -fsS -m 15 -o /dev/null \
-        "${HS_ADDRESS_CHECK%/}/_matrix/client/v1/auth_metadata" 2>/dev/null; then
+if [ -n "$HS_ADDRESS_CHECK" ] && curl -fsS -m 15 \
+        "${HS_ADDRESS_CHECK%/}/_matrix/client/v1/auth_metadata" 2>/dev/null \
+        | grep -q '"issuer"'; then
     MAS_DETECTED=true
-    if MAS_PATCHED=$(python3 -c "
-import os, re
+    if MAS_STATUS=$(python3 - "$CONFIG" "$REGISTRATION" <<'PYMAS'
+import os, re, sys
 
-def set_or_insert(path, key, indent, anchor):
-    '''Set 'key: true' in path, inserting it under anchor if absent. Only the
-    one value is ever rewritten -- indentation and any trailing comment are
-    preserved, and nothing else in the file is reflowed.'''
-    text = open(path).read()
-    pattern = r'^(' + re.escape(indent) + re.escape(key) + r'[ \t]*:)([^\n#]*)'
+def _write(path, lines):
+    open(path, 'w').write('\n'.join(lines))
 
-    def repl(m):
-        tail = m.group(2)
-        gap = tail[len(tail.rstrip(' \t')):]
-        return m.group(1) + ' true' + gap
+def set_block_flag(path, block, key):
+    '''Set 'key: true' inside a top-level block mapping. Indentation is taken
+    from the block's own first key, never assumed. Returns 'set', 'already' or
+    'failed'; 'failed' means nothing was written.'''
+    lines = open(path).read().split('\n')
+    header = None
+    for i, line in enumerate(lines):
+        m = re.match(r'^' + re.escape(block) + r'[ \t]*:(.*)$', line)
+        if m:
+            # Anything other than a comment after the colon means the block is
+            # inline/flow style, which cannot take a spliced line.
+            if m.group(1).strip() and not m.group(1).lstrip().startswith('#'):
+                return 'failed'
+            header = i
+            break
+    if header is None:
+        return 'failed'
 
-    if re.search(pattern, text, re.MULTILINE):
-        new = re.sub(pattern, repl, text, count=1, flags=re.MULTILINE)
-    elif anchor is None:
-        new = text if text.endswith('\n') else text + '\n'
-        new += indent + key + ': true\n'
-    else:
-        new, n = re.subn(r'^(' + re.escape(anchor) + r'[ \t]*)$',
-                         r'\1\n' + indent + key + ': true',
-                         text, count=1, flags=re.MULTILINE)
-        if n == 0:
-            return False
-    if new != text:
-        open(path, 'w').write(new)
-        return True
-    return False
+    indent = None
+    end = len(lines)
+    for i in range(header + 1, len(lines)):
+        line = lines[i]
+        if not line.strip():
+            continue
+        lead = line[:len(line) - len(line.lstrip(' \t'))]
+        if not lead:
+            end = i
+            break
+        if indent is None:
+            indent = lead
+    # YAML forbids tabs in indentation, so a tab here means the file is already
+    # invalid; there is no safe edit to make and no parser available to check.
+    if indent is None or indent.strip(' ') != '':
+        return 'failed'
 
-changed = set_or_insert('$CONFIG', 'msc4190', '    ', 'encryption:')
-if os.path.exists('$REGISTRATION'):
-    changed |= set_or_insert('$REGISTRATION', 'io.element.msc4190', '', None)
-print('changed' if changed else 'unchanged')
-"); then
-        echo "✓ Homeserver uses Matrix Authentication Service — MSC4190 enabled in config and registration"
-        if [ "$MAS_PATCHED" = "changed" ]; then
-            echo "  Restart your homeserver so it picks up io.element.msc4190 in the registration."
-        fi
+    pattern = re.compile(r'^(' + re.escape(indent) + re.escape(key) + r'[ \t]*:)([^\n]*)$')
+    for i in range(header + 1, end):
+        m = pattern.match(lines[i])
+        if not m:
+            continue
+        value = m.group(2)
+        # YAML opens an inline comment only after whitespace.
+        cut = len(value)
+        for j, ch in enumerate(value):
+            if ch == '#' and (j == 0 or value[j-1] in ' \t'):
+                cut = j
+                break
+        head, comment = value[:cut], value[cut:]
+        gap = head[len(head.rstrip(' \t')):]
+        if head.strip() == 'true':
+            return 'already'
+        lines[i] = m.group(1) + ' true' + gap + comment
+        _write(path, lines)
+        return 'set'
+
+    lines.insert(header + 1, indent + key + ': true')
+    _write(path, lines)
+    return 'set'
+
+def set_top_level_flag(path, key):
+    '''Set a column-0 'key: true', appending it if absent.'''
+    lines = open(path).read().split('\n')
+    pattern = re.compile(r'^(' + re.escape(key) + r'[ \t]*:)([^\n]*)$')
+    for i, line in enumerate(lines):
+        m = pattern.match(line)
+        if not m:
+            continue
+        if m.group(2).strip() == 'true':
+            return 'already'
+        lines[i] = m.group(1) + ' true'
+        _write(path, lines)
+        return 'set'
+    while lines and not lines[-1].strip():
+        lines.pop()
+    lines.append(key + ': true')
+    lines.append('')
+    _write(path, lines)
+    return 'set'
+
+config, registration = sys.argv[1], sys.argv[2]
+
+# Config first: a registration that declares MSC4190 while the bridge config
+# still says msc4190: false makes Synapse refuse appservice login outright, so
+# never leave that combination behind.
+cfg = set_block_flag(config, 'encryption', 'msc4190')
+if cfg == 'failed':
+    print('config failed')
+    sys.exit(1)
+
+if not os.path.exists(registration):
+    print(cfg, 'registration missing')
+    sys.exit(0)
+
+reg = set_top_level_flag(registration, 'io.element.msc4190')
+if reg == 'failed':
+    print(cfg, 'registration failed')
+    sys.exit(1)
+print(cfg, reg)
+PYMAS
+    ); then
+        echo "✓ Homeserver uses Matrix Authentication Service"
+        case "$MAS_STATUS" in
+            "set "*)     echo "  • config.yaml: enabled encryption.msc4190" ;;
+            "already "*) echo "  • config.yaml: encryption.msc4190 already enabled" ;;
+        esac
+        case "$MAS_STATUS" in
+            *" set")     echo "  • registration.yaml: enabled io.element.msc4190"
+                         echo "  Restart your homeserver so it picks up the registration change." ;;
+            *" already") echo "  • registration.yaml: io.element.msc4190 already enabled" ;;
+            *"registration missing")
+                         echo "  • registration.yaml not found — nothing written there" ;;
+        esac
     else
-        echo "⚠ Homeserver uses Matrix Authentication Service, but the MSC4190 flags could not be"
-        echo "  set automatically. Set encryption.msc4190: true in $CONFIG and"
-        echo "  io.element.msc4190: true in the appservice registration, then restart the homeserver."
+        echo "⚠ Homeserver uses Matrix Authentication Service, but the MSC4190 flags could not"
+        echo "  be set automatically (reason: ${MAS_STATUS:-unknown}). Nothing was written."
+        echo "  Add this to $CONFIG by hand:"
+        echo "      encryption:"
+        echo "          msc4190: true"
+        echo "  An encrypted bridge cannot start against MAS without it."
     fi
 fi
 
@@ -341,9 +425,10 @@ if [ "$FIRST_RUN" = true ]; then
     echo "└─────────────────────────────────────────────────┘"
     echo ""
     if [ "$MAS_DETECTED" = true ]; then
-        echo "Your homeserver uses Matrix Authentication Service, so the registration above"
-        echo "carries io.element.msc4190: true — the homeserver restart is what makes it take"
-        echo "effect. Without it the bridge cannot create its bot device."
+        echo "Your homeserver uses Matrix Authentication Service. The bridge bot device is"
+        echo "created with MSC4190 instead of appservice login (encryption.msc4190 is set)."
+        echo "The registration above also carries io.element.msc4190: true, which Synapse"
+        echo "before 1.141 requires for that; 1.141+ allows it without the opt-in flag."
         echo ""
         echo "Double puppeting also needs an appservice under MAS (shared-secret login is gone)."
         echo "See the \"Matrix Authentication Service\" section of the README."

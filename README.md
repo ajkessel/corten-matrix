@@ -578,25 +578,38 @@ failed to start Matrix connector: homeserver does not support appservice login
 
 The replacement is [MSC4190](https://github.com/matrix-org/matrix-spec-proposals/pull/4190), which
 creates the device with `PUT /_matrix/client/v3/devices/{deviceID}` using the appservice token. mautrix
-implements it already; it just has to be switched on in **two** places:
+implements it already; it only has to be switched on:
 
-1. `config.yaml`:
+```yaml
+encryption:
+    msc4190: true
+```
 
-   ```yaml
-   encryption:
-       msc4190: true
-   ```
+**On Synapse 1.141 or newer that is all you need.** Since
+[#19031](https://github.com/element-hq/synapse/pull/19031) ("Allow using MSC4190 behavior without the
+opt-in registration flag", released in 1.141.0), `PUT /devices/{deviceID}` creates the device for any
+appservice — `synapse/rest/client/devices.py` branches on `requester.app_service_id` and does not consult
+the registration flag at all. Device masquerading is likewise unconditional now, so
+`experimental_features.msc3202_device_masquerading` is no longer needed either.
 
-2. The appservice registration file your **homeserver** reads (the one listed in
-   `app_service_config_files`), at the top level:
+**On Synapse older than 1.141** you additionally need, in the appservice registration file your
+**homeserver** reads (the one listed in `app_service_config_files`), at the top level:
 
-   ```yaml
-   io.element.msc4190: true
-   ```
+```yaml
+io.element.msc4190: true
+```
 
-   Then restart the homeserver. Synapse still reads exactly this key; the old
-   `msc3202_device_masquerading` experimental feature is no longer needed (device masquerading is
-   unconditional since Synapse 1.141).
+plus, in `homeserver.yaml`:
+
+```yaml
+experimental_features:
+    msc3202_device_masquerading: true
+```
+
+Then restart the homeserver. Setup writes the registration flag whenever it detects MAS, so it is
+belt-and-braces on current Synapse rather than something you have to reason about. Note that on any
+version, that flag makes Synapse *refuse* appservice login — which is harmless once `encryption.msc4190`
+is on, but means you should never set it while the bridge config still says `msc4190: false`.
 
 `scripts/install.sh` probes for MAS during setup and sets both flags for you, and the bridge re-checks on
 every start — if it finds MAS with `encryption.allow: true` but `msc4190` off, it enables `msc4190` in

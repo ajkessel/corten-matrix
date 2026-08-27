@@ -10,6 +10,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -254,9 +255,12 @@ const masAuthMetadataPath = "/_matrix/client/v1/auth_metadata"
 // scalar line is rewritten, so comments and formatting survive), the write is
 // atomic, and it is idempotent.
 //
-// The matching homeserver-side flag (io.element.msc4190: true in the appservice
-// registration) lives on the homeserver and can't be set from here, so we print
-// what the operator still has to do.
+// Synapse 1.141+ needs nothing else: PUT /devices/{deviceID} creates the device
+// for any appservice (rest/client/devices.py branches on requester.app_service_id
+// and never consults the registration flag). Older Synapse also wants
+// io.element.msc4190 in the appservice registration, which lives on the
+// homeserver and can't be set from here — hence the printed note rather than a
+// silent assumption either way.
 func ensureMASCompatibility(br *mxmain.BridgeMain) {
 	if br.Config == nil || !br.Config.Encryption.Allow || br.Config.Encryption.MSC4190 {
 		return
@@ -277,14 +281,21 @@ func ensureMASCompatibility(br *mxmain.BridgeMain) {
 				br.ConfigPath, err)
 		}
 	}
-	fmt.Fprintf(os.Stderr, "ACTION REQUIRED: add `io.element.msc4190: true` to this bridge's appservice "+
-		"registration on the homeserver and restart the homeserver, otherwise creating the bot "+
-		"device will fail. See https://docs.mau.fi/bridges/general/end-to-bridge-encryption.html\n")
+	fmt.Fprintf(os.Stderr, "If your homeserver is older than Synapse 1.141, also add "+
+		"`io.element.msc4190: true` to this bridge's appservice registration and restart the "+
+		"homeserver — otherwise creating the bot device will fail. Synapse 1.141+ needs nothing "+
+		"further. See https://docs.mau.fi/bridges/general/end-to-bridge-encryption.html\n")
 }
 
 // homeserverUsesMAS reports whether the homeserver delegates authentication to
 // Matrix Authentication Service. Errors mean "unknown", which is reported as
 // false so a transient network problem can never flip the config.
+//
+// A 200 is not by itself proof: an intermediary that answers 200 for unknown
+// paths (a `try_files ... /index.html` catch-all in front of the homeserver, or
+// a proxy redirecting unknown /_matrix paths to a login page) would otherwise
+// read as MAS. So the body has to parse as the MSC2965 metadata document, whose
+// `issuer` field is required by the spec.
 func homeserverUsesMAS(address string) bool {
 	if address == "" {
 		return false
@@ -308,8 +319,17 @@ func homeserverUsesMAS(address string) bool {
 		return false
 	}
 	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, resp.Body)
-	return resp.StatusCode == http.StatusOK
+	if resp.StatusCode != http.StatusOK {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return false
+	}
+	var meta struct {
+		Issuer string `json:"issuer"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&meta); err != nil {
+		return false
+	}
+	return meta.Issuer != ""
 }
 
 // setMSC4190OnDisk sets encryption.msc4190 to true in the config file, editing
@@ -355,6 +375,17 @@ func setMSC4190OnDisk(configPath string) error {
 	// Key absent (config predates the framework option, e.g. when the bridge
 	// runs with --no-update): splice it in as the encryption block's first key,
 	// matching that block's existing indentation.
+	//
+	// That only works for a block mapping. In `encryption: {allow: true}` the
+	// first key shares a line with the parent key, so a spliced line would land
+	// in whatever block precedes it and produce a config that no longer parses
+	// — the one thing this function must never do. Note that comparing line
+	// numbers does not distinguish the two: yaml.v3 reports a block mapping's
+	// Line as its first key's line, so Content[0].Line == encryption.Line holds
+	// for block style too. Only the style flag tells them apart.
+	if encryption.Style&yaml.FlowStyle != 0 {
+		return fmt.Errorf("encryption block is flow-style; add `msc4190: true` to it manually")
+	}
 	indent := strings.Repeat(" ", encryption.Content[0].Column-1)
 	after := encryption.Content[0].Line - 1 // insert above the first existing key
 	if after < 1 || after > len(lines) {
@@ -371,6 +402,10 @@ func setMSC4190OnDisk(configPath string) error {
 // around the value — indentation, the spacing after the colon, and any trailing
 // comment together with the whitespace in front of it — is preserved byte for
 // byte, so rewriting a value never reflows the file.
+//
+// Comment detection follows YAML: `#` only opens a comment at the start of a
+// line or after whitespace, so a `#` inside a value (`key: "a#b"`) is left
+// alone rather than being mistaken for a trailing comment.
 func setScalarInLine(line, key, value string) (string, bool) {
 	idx := strings.Index(line, key+":")
 	if idx < 0 || strings.TrimSpace(line[:idx]) != "" {
@@ -382,10 +417,25 @@ func setScalarInLine(line, key, value string) (string, bool) {
 		lead = " "
 	}
 	gap, comment := "", ""
-	if c := strings.Index(rest, "#"); c >= 0 {
+	if c := inlineCommentIndex(rest); c >= 0 {
 		beforeComment := rest[:c]
 		gap = beforeComment[len(strings.TrimRight(beforeComment, " \t")):]
 		comment = rest[c:]
 	}
 	return line[:idx] + key + ":" + lead + value + gap + comment, true
+}
+
+// inlineCommentIndex returns the index of the `#` that opens a trailing comment
+// in the value portion of a config line, or -1 if there is none. Per YAML, that
+// requires the `#` to be preceded by whitespace.
+func inlineCommentIndex(valuePart string) int {
+	for i, r := range valuePart {
+		if r != '#' {
+			continue
+		}
+		if i == 0 || valuePart[i-1] == ' ' || valuePart[i-1] == '\t' {
+			return i
+		}
+	}
+	return -1
 }
