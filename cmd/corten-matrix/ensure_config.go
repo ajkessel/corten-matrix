@@ -134,12 +134,21 @@ func ensureNetworkConfigKeys(configPath string) {
 
 // mappingValue returns the value node for key in a YAML mapping node, or nil.
 func mappingValue(mapping *yaml.Node, key string) *yaml.Node {
+	_, value := mappingEntry(mapping, key)
+	return value
+}
+
+// mappingEntry returns both the key and value nodes for key in a YAML mapping,
+// or nils. The key node is what carries the parent line: for a block mapping
+// yaml.v3 reports the *value* node's Line as its first child's line, so the
+// `foo:` line itself is only reachable through the key node.
+func mappingEntry(mapping *yaml.Node, key string) (keyNode, value *yaml.Node) {
 	for i := 0; i+1 < len(mapping.Content); i += 2 {
 		if mapping.Content[i].Value == key {
-			return mapping.Content[i+1]
+			return mapping.Content[i], mapping.Content[i+1]
 		}
 	}
-	return nil
+	return nil, nil
 }
 
 // maxNodeLine returns the largest source line number anywhere in the subtree,
@@ -348,7 +357,7 @@ func setMSC4190OnDisk(configPath string) error {
 	if len(root.Content) == 0 || root.Content[0].Kind != yaml.MappingNode {
 		return fmt.Errorf("unexpected config structure")
 	}
-	encryption := mappingValue(root.Content[0], "encryption")
+	encryptionKey, encryption := mappingEntry(root.Content[0], "encryption")
 	if encryption == nil || encryption.Kind != yaml.MappingNode || len(encryption.Content) == 0 {
 		return fmt.Errorf("no encryption block in config")
 	}
@@ -386,10 +395,15 @@ func setMSC4190OnDisk(configPath string) error {
 	if encryption.Style&yaml.FlowStyle != 0 {
 		return fmt.Errorf("encryption block is flow-style; add `msc4190: true` to it manually")
 	}
+	// Indent from the block's first key, but insert directly below the
+	// `encryption:` line rather than above that key: keys in a generated config
+	// each carry a leading comment, and splicing above the key would sit between
+	// that comment and the key it documents, silently reassigning it to
+	// msc4190. This also matches where the install scripts insert.
 	indent := strings.Repeat(" ", encryption.Content[0].Column-1)
-	after := encryption.Content[0].Line - 1 // insert above the first existing key
+	after := encryptionKey.Line // insert on the line after `encryption:`
 	if after < 1 || after > len(lines) {
-		return fmt.Errorf("encryption block line %d out of range", encryption.Content[0].Line)
+		return fmt.Errorf("encryption block line %d out of range", encryptionKey.Line)
 	}
 	out := make([]string, 0, len(lines)+1)
 	out = append(out, lines[:after]...)

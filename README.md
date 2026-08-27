@@ -619,7 +619,8 @@ attach to):
 ```
 failed to share device keys: M_UNKNOWN (HTTP 400): To upload keys, you must pass device_id when authenticating
 ```
- Setup writes the registration flag whenever it detects MAS, so it is
+
+Setup writes the registration flag whenever it detects MAS, so it is
 belt-and-braces on current Synapse rather than something you have to reason about. Note that on any
 version, that flag makes Synapse *refuse* appservice login — which is harmless once `encryption.msc4190`
 is on, but means you should never set it while the bridge config still says `msc4190: false`.

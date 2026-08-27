@@ -361,11 +361,16 @@ def set_block_flag(path, block, key):
     if header is None:
         return 'failed'
 
+    # Take the indent from the block's first real key. Comments are skipped for
+    # both purposes: a comment may be indented differently from the keys around
+    # it (so it must not define the indent), and a comment at column 0 does not
+    # end the block (so it must not stop the search for an existing key).
     indent = None
     end = len(lines)
     for i in range(header + 1, len(lines)):
         line = lines[i]
-        if not line.strip():
+        stripped = line.strip()
+        if not stripped or stripped.startswith('#'):
             continue
         lead = line[:len(line) - len(line.lstrip(' \t'))]
         if not lead:
@@ -427,7 +432,16 @@ config, registration = sys.argv[1], sys.argv[2]
 # Config first: a registration that declares MSC4190 while the bridge config
 # still says msc4190: false makes Synapse refuse appservice login outright, so
 # never leave that combination behind.
-cfg = set_block_flag(config, 'encryption', 'msc4190')
+#
+# Every exit reports what actually happened to each file, including when a write
+# raises (an unreadable or read-only registration is plausible when it lives in a
+# homeserver-owned directory). The caller must never be told a file is untouched
+# when it isn't.
+try:
+    cfg = set_block_flag(config, 'encryption', 'msc4190')
+except OSError as e:
+    print('config failed:', e)
+    sys.exit(1)
 if cfg == 'failed':
     print('config failed')
     sys.exit(1)
@@ -436,7 +450,11 @@ if not os.path.exists(registration):
     print(cfg, 'registration missing')
     sys.exit(0)
 
-reg = set_top_level_flag(registration, 'io.element.msc4190')
+try:
+    reg = set_top_level_flag(registration, 'io.element.msc4190')
+except OSError as e:
+    print(cfg, 'registration failed:', e)
+    sys.exit(1)
 if reg == 'failed':
     print(cfg, 'registration failed')
     sys.exit(1)
@@ -456,12 +474,27 @@ PYMAS
                          echo "  • registration.yaml not found — nothing written there" ;;
         esac
     else
-        echo "⚠ Homeserver uses Matrix Authentication Service, but the MSC4190 flags could not"
-        echo "  be set automatically (reason: ${MAS_STATUS:-unknown}). Nothing was written."
-        echo "  Add this to $CONFIG by hand:"
-        echo "      encryption:"
-        echo "          msc4190: true"
-        echo "  An encrypted bridge cannot start against MAS without it."
+        # Report only what actually happened. The config is written first, so a
+        # failure here can mean either "nothing was written" or "config written,
+        # registration failed" — never claim the former when it was the latter.
+        case "${MAS_STATUS:-}" in
+            set*|already*)
+                echo "⚠ Homeserver uses Matrix Authentication Service. encryption.msc4190 IS set in"
+                echo "  $CONFIG, but io.element.msc4190 could not be written to the registration:"
+                echo "  ${MAS_STATUS#* }"
+                echo "  Synapse 1.141+ needs nothing further, so the bridge should still work. On an"
+                echo "  older homeserver, add io.element.msc4190: true to the registration by hand"
+                echo "  and restart the homeserver."
+                ;;
+            *)
+                echo "⚠ Homeserver uses Matrix Authentication Service, but the MSC4190 flags could not"
+                echo "  be set automatically (reason: ${MAS_STATUS:-unknown}). Nothing was written."
+                echo "  Add this to $CONFIG by hand:"
+                echo "      encryption:"
+                echo "          msc4190: true"
+                echo "  An encrypted bridge cannot start against MAS without it."
+                ;;
+        esac
     fi
 fi
 

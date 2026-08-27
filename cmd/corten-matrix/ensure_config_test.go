@@ -306,3 +306,36 @@ func TestSetScalarInLinePreservesHashInValue(t *testing.T) {
 		t.Errorf("setScalarInLine = %q, want %q", got, want)
 	}
 }
+
+// A generated config gives every key a leading comment. Splicing above the
+// first key would put msc4190 between that comment and the key it documents,
+// quietly reassigning it. The key must land directly under `encryption:`, and
+// the result must match what the install scripts produce for the same input
+// (scripts/mas_flags_test.go covers that side).
+func TestSetMSC4190OnDiskKeepsCommentsWithTheirKeys(t *testing.T) {
+	tests := []struct{ name, in, want string }{{
+		name: "comment indented differently from the key",
+		in:   "encryption:\n  # whether to enable encryption\n    allow: true\n",
+		want: "encryption:\n    msc4190: true\n  # whether to enable encryption\n    allow: true\n",
+	}, {
+		name: "generated-config shape",
+		in:   "encryption:\n    # Whether to enable encryption at all.\n    allow: false\n    default: false\n",
+		want: "encryption:\n    msc4190: true\n    # Whether to enable encryption at all.\n    allow: false\n    default: false\n",
+	}}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			path := writeConfig(t, tc.in)
+			if err := setMSC4190OnDisk(path); err != nil {
+				t.Fatalf("setMSC4190OnDisk: %v", err)
+			}
+			data, _ := os.ReadFile(path)
+			if string(data) != tc.want {
+				t.Errorf("got:\n%s\nwant:\n%s", data, tc.want)
+			}
+			var probe yaml.Node
+			if err := yaml.Unmarshal(data, &probe); err != nil {
+				t.Errorf("result does not parse: %v", err)
+			}
+		})
+	}
+}
