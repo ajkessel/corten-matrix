@@ -806,6 +806,11 @@ func (c *IMClient) setContactsReady(log zerolog.Logger) {
 	go func() {
 		c.refreshGhostNamesFromContacts(log)
 		c.refreshDMPortalNamesFromContacts(log)
+		// Runs last and only here: the repair pushes each DM's name from its
+		// GHOST, so it must not run until contacts are loaded AND the ghost
+		// reconcile above has replaced any raw-handle names. Self-gating via a
+		// KV flag, so it is one cheap lookup per tick once it has completed.
+		c.repairDivergedDMRoomNames(log)
 	}()
 	// Presence subscription only needs to run on first-ready and whenever new
 	// StatusKit keys arrive (via OnKeysReceived). The ghost set doesn't change
