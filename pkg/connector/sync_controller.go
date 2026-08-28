@@ -3861,11 +3861,31 @@ func (c *IMClient) resolvePortalIDForCloudChat(participants []string, displayNam
 	return string(portalKey.ID)
 }
 
-// groupConsolidationEntry pairs a group portal with the canonical
-// participant key its conversation should live under.
+// groupConsolidationEntry pairs one cloud_chat row (a single conversation) with
+// the portal it currently lives in and the canonical participant key its own
+// roster implies. Several entries can share portalID: the design puts one room
+// per participant set, so distinct chats with identical rosters legitimately
+// share a portal until one of their rosters changes.
 type groupConsolidationEntry struct {
-	portalID  string
-	canonical string
+	cloudChatID string
+	portalID    string
+	canonical   string
+}
+
+// groupRowReKey moves ONE conversation's cloud rows to the portal key its own
+// roster implies, without touching the other conversations that share its
+// current portal ID.
+type groupRowReKey struct {
+	cloudChatID string
+	from        string
+	to          string
+}
+
+// groupConsolidationPlan separates the two kinds of work: per-conversation
+// re-keys (pure DB) and Matrix room merges (homeserver round trips, budgeted).
+type groupConsolidationPlan struct {
+	rowReKeys  []groupRowReKey
+	roomGroups []groupConsolidationGroup
 }
 
 // groupConsolidationGroup is the set of group portals that resolve to
@@ -3875,35 +3895,92 @@ type groupConsolidationGroup struct {
 	members   []string // distinct portal IDs sharing this canonical key, sorted
 }
 
-// planGroupConsolidation groups portals by canonical key and returns those
-// needing consolidation: more than one portal, or a single portal whose ID isn't
-// already the canonical key. Pure logic — the testable core of the migration.
-func planGroupConsolidation(entries []groupConsolidationEntry) []groupConsolidationGroup {
-	byKey := make(map[string]map[string]bool)
+// planGroupConsolidation decides, for each conversation and each room, where it
+// should live. Pure logic — the testable core of the migration.
+//
+// Two rules keep it CONVERGENT, which the previous version was not:
+//
+//  1. A conversation is re-keyed to its own canonical participant key, by
+//     cloud_chat_id. Previously every row sharing a portal ID was dragged to
+//     one key, so a conversation whose roster disagreed kept demanding its own
+//     key back — the room ping-ponged between two rosters on every startup,
+//     kicking and re-inviting the difference each time (observed: three
+//     startups in a row, opposite direction each time).
+//
+//  2. A ROOM only moves when the conversations under it agree. If any row still
+//     claims the room's current key, the room stays put and the disagreeing
+//     rows split off to their own keys (a new room is built for them from the
+//     re-keyed rows). Only when no row claims the current key does the room
+//     move, and then to a deterministically chosen key so two runs can never
+//     pick opposite directions.
+func planGroupConsolidation(entries []groupConsolidationEntry) groupConsolidationPlan {
+	byPortal := make(map[string][]groupConsolidationEntry)
 	for _, e := range entries {
 		if e.canonical == "" || e.portalID == "" {
 			continue
 		}
-		if byKey[e.canonical] == nil {
-			byKey[e.canonical] = make(map[string]bool)
-		}
-		byKey[e.canonical][e.portalID] = true
+		byPortal[e.portalID] = append(byPortal[e.portalID], e)
 	}
 
-	var out []groupConsolidationGroup
-	for canonical, set := range byKey {
-		members := make([]string, 0, len(set))
-		for id := range set {
-			members = append(members, id)
+	var plan groupConsolidationPlan
+	roomMembers := make(map[string]map[string]bool) // canonical -> portal IDs to merge in
+	portalIDs := make([]string, 0, len(byPortal))
+	for portalID := range byPortal {
+		portalIDs = append(portalIDs, portalID)
+	}
+	sort.Strings(portalIDs)
+
+	for _, portalID := range portalIDs {
+		rows := byPortal[portalID]
+		canonicals := make(map[string]bool, len(rows))
+		for _, r := range rows {
+			canonicals[r.canonical] = true
+			if r.canonical != portalID && r.cloudChatID != "" {
+				plan.rowReKeys = append(plan.rowReKeys, groupRowReKey{
+					cloudChatID: r.cloudChatID,
+					from:        portalID,
+					to:          r.canonical,
+				})
+			}
+		}
+		if canonicals[portalID] {
+			// Some conversation here already agrees with the room's key: the
+			// room is where it belongs. Rows that disagree were re-keyed above
+			// and get their own room.
+			continue
+		}
+		// Nobody claims the current key. With one canonical this is the ordinary
+		// rename (the roster changed); with several, pick the lowest key so the
+		// choice is stable across runs instead of depending on row order.
+		targets := make([]string, 0, len(canonicals))
+		for c := range canonicals {
+			targets = append(targets, c)
+		}
+		sort.Strings(targets)
+		target := targets[0]
+		if roomMembers[target] == nil {
+			roomMembers[target] = make(map[string]bool)
+		}
+		roomMembers[target][portalID] = true
+	}
+
+	canonicalKeys := make([]string, 0, len(roomMembers))
+	for canonical := range roomMembers {
+		canonicalKeys = append(canonicalKeys, canonical)
+	}
+	sort.Strings(canonicalKeys)
+	for _, canonical := range canonicalKeys {
+		members := make([]string, 0, len(roomMembers[canonical]))
+		for portalID := range roomMembers[canonical] {
+			members = append(members, portalID)
 		}
 		sort.Strings(members)
-		needs := len(members) > 1 || members[0] != canonical
-		if needs {
-			out = append(out, groupConsolidationGroup{canonical: canonical, members: members})
-		}
+		plan.roomGroups = append(plan.roomGroups, groupConsolidationGroup{
+			canonical: canonical,
+			members:   members,
+		})
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].canonical < out[j].canonical })
-	return out
+	return plan
 }
 
 // mergeOrphanedGroupRooms folds gid: rooms discovered by
@@ -3969,10 +4046,15 @@ func (c *IMClient) consolidateGroupPortals(ctx context.Context, log zerolog.Logg
 			continue
 		}
 		canonical := strings.Join(c.buildCanonicalParticipantList(chat.participants), ",")
-		entries = append(entries, groupConsolidationEntry{portalID: chat.portalID, canonical: canonical})
+		entries = append(entries, groupConsolidationEntry{
+			cloudChatID: chat.cloudChatID,
+			portalID:    chat.portalID,
+			canonical:   canonical,
+		})
 	}
 
-	groups := planGroupConsolidation(entries)
+	plan := planGroupConsolidation(entries)
+	groups := plan.roomGroups
 
 	// Rediscover gid: rooms whose move was deferred on a prior startup: their
 	// cloud rows are already canonical (so the participant-key path above no
@@ -3980,6 +4062,10 @@ func (c *IMClient) consolidateGroupPortals(ctx context.Context, log zerolog.Logg
 	// re-ID'd/tombstoned onto the canonical key. Checked even when the
 	// participant-key path above found nothing to do, since an orphan can be
 	// the only thing left to consolidate. See orphanedGroupRoomPortalIDs.
+	//
+	// Folded into the ROOM groups, not the row re-keys: an orphan's cloud rows
+	// are already on the canonical key by definition, so there is nothing to
+	// re-key — only a room to move.
 	if orphans, oErr := c.cloudStore.orphanedGroupRoomPortalIDs(ctx, string(c.Main.Bridge.ID)); oErr != nil {
 		log.Warn().Err(oErr).Msg("Failed to look up orphaned gid: group rooms")
 	} else if len(orphans) > 0 {
@@ -3988,7 +4074,7 @@ func (c *IMClient) consolidateGroupPortals(ctx context.Context, log zerolog.Logg
 			Msg("Found gid: group rooms orphaned by a prior deferred consolidation")
 	}
 
-	if len(groups) == 0 {
+	if len(plan.rowReKeys) == 0 && len(groups) == 0 {
 		return
 	}
 
@@ -3997,18 +4083,23 @@ func (c *IMClient) consolidateGroupPortals(ctx context.Context, log zerolog.Logg
 		maxRooms += len(g.members)
 	}
 	log.Info().Int("groups", len(groups)).Int("max_member_rooms", maxRooms).
+		Int("row_rekeys", len(plan.rowReKeys)).
 		Msg("Planning group consolidation")
 
-	// Re-key every group's cloud rows to its canonical participant key up front,
-	// including groups whose room moves are deferred below. This is pure DB work
-	// (no homeserver round trips), so it's unbudgeted — and doing it for deferred
-	// groups too means createPortalsFromCloudSync (which dedups by group_id)
-	// builds a single canonical room per participant set, instead of one room per
+	// Re-key each conversation's cloud rows to the participant key its OWN roster
+	// implies, by cloud_chat_id. Pure DB work (no homeserver round trips), so it's
+	// unbudgeted — and doing it for budget-deferred groups too means
+	// createPortalsFromCloudSync (which dedups by group_id) builds a single
+	// canonical room per participant set, instead of one room per
 	// not-yet-consolidated gid:<UUID> variant that a later startup would have to
 	// tombstone (re-spending the room-move budget). Correctness depends on it: a
 	// rotated GUID can shard into several gid: rooms, not just one.
+	c.reKeyGroupCloudRows(ctx, log, plan.rowReKeys)
 	for _, g := range groups {
-		c.reKeyGroupCloudData(ctx, log, g)
+		if err := c.cloudStore.resetForwardBackfillDone(ctx, g.canonical); err != nil {
+			log.Warn().Err(err).Str("canonical", g.canonical).
+				Msg("Failed to reset backfill state for canonical group portal")
+		}
 	}
 
 	// Bound the Matrix room moves (re-ID / tombstone — each a homeserver round
@@ -4095,27 +4186,33 @@ func planGroupRoomMoves(canonical string, canonicalHasRoom bool, members []group
 	return plan
 }
 
-// reKeyGroupCloudData re-keys every member's cloud rows to the group's canonical
-// participant key and resets the canonical portal's forward-backfill state so the
-// survivor re-backfills the union of their messages. Pure DB work (no homeserver
-// round trips), so consolidateGroupPortals runs it for every group each startup —
-// including budget-deferred ones — to keep cloud keys canonical ahead of the
-// (budgeted) room moves.
-func (c *IMClient) reKeyGroupCloudData(ctx context.Context, log zerolog.Logger, g groupConsolidationGroup) {
-	for _, m := range g.members {
-		if err := c.cloudStore.reKeyPortalID(ctx, m, g.canonical); err != nil {
-			log.Warn().Err(err).Str("old_portal_id", m).Str("canonical", g.canonical).
+// reKeyGroupCloudRows applies the plan's per-conversation re-keys: each moves ONE
+// chat's cloud rows (matched by cloud_chat_id) to the portal key its own roster
+// implies, leaving the other conversations that share its current portal ID
+// alone. Re-keying by portal ID instead is what let a foreign conversation be
+// dragged onto a key its roster disagreed with, so it demanded its own key back
+// on the next startup and the room ping-ponged between two rosters — kicking and
+// re-inviting the difference every restart.
+func (c *IMClient) reKeyGroupCloudRows(ctx context.Context, log zerolog.Logger, reKeys []groupRowReKey) {
+	for _, rk := range reKeys {
+		if err := c.cloudStore.reKeyChatRowPortalID(ctx, rk.cloudChatID, rk.to); err != nil {
+			log.Warn().Err(err).
+				Str("cloud_chat_id", rk.cloudChatID).
+				Str("old_portal_id", rk.from).
+				Str("canonical", rk.to).
 				Msg("Failed to re-key group cloud data")
+			continue
 		}
-	}
-	if err := c.cloudStore.resetForwardBackfillDone(ctx, g.canonical); err != nil {
-		log.Warn().Err(err).Str("canonical", g.canonical).
-			Msg("Failed to reset backfill state for canonical group portal")
+		log.Debug().
+			Str("cloud_chat_id", rk.cloudChatID).
+			Str("old_portal_id", rk.from).
+			Str("canonical", rk.to).
+			Msg("Re-keyed group conversation to its own participant key")
 	}
 }
 
 // moveGroupRooms merges a single group's existing Matrix rooms onto the canonical
-// key. Assumes reKeyGroupCloudData already re-keyed the group's cloud rows.
+// key. Assumes reKeyGroupCloudRows already re-keyed the group's cloud rows.
 // Returns the number of room re-ID/tombstone operations it attempted (each a
 // homeserver round trip), so the caller can budget room moves across groups per
 // startup.

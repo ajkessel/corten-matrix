@@ -1124,3 +1124,118 @@ func TestDialectHelpersSpellEachDialectCorrectly(t *testing.T) {
 		t.Errorf("sqlBlobType(Postgres) = %q, want BYTEA", got)
 	}
 }
+
+// TestReKeyChatRowPortalIDLeavesSharedPortalSiblings is the store-level half of
+// the group-membership flip-flop fix: two conversations can share one portal ID
+// (the design puts one room per participant set), so a re-key MUST move only the
+// chat it names. The old statement matched on the old portal ID and moved both,
+// which put a conversation under a key its own roster disagreed with — and it
+// demanded its key back on the next startup, ping-ponging the room's member list
+// between two rosters on every restart.
+func TestReKeyChatRowPortalIDLeavesSharedPortalSiblings(t *testing.T) {
+	ctx := context.Background()
+	db := newTestSQLiteDB(t)
+	store := newCloudBackfillStore(db, testSQLLoginID)
+	if err := store.ensureSchema(ctx); err != nil {
+		t.Fatalf("ensureSchema: %v", err)
+	}
+
+	const shared = "tel:+15551111111,tel:+15552222222"
+	const diverged = "tel:+15551111111,tel:+15552222222,tel:+15553333333"
+	for _, chat := range []struct {
+		id      string
+		group   string
+		members []string
+	}{
+		{"chat-stay", "group-stay", []string{"tel:+15551111111", "tel:+15552222222"}},
+		{"chat-move", "group-move", []string{"tel:+15551111111", "tel:+15552222222", "tel:+15553333333"}},
+	} {
+		if err := store.upsertChat(ctx, chat.id, "rec-"+chat.id, chat.group, shared, "SMS", nil, nil, chat.members, time.Now().UnixMilli()); err != nil {
+			t.Fatalf("upsertChat(%s): %v", chat.id, err)
+		}
+	}
+
+	if err := store.reKeyChatRowPortalID(ctx, "chat-move", diverged); err != nil {
+		t.Fatalf("reKeyChatRowPortalID: %v", err)
+	}
+
+	rows, err := store.listGroupChats(ctx)
+	if err != nil {
+		t.Fatalf("listGroupChats: %v", err)
+	}
+	got := make(map[string]string, len(rows))
+	for _, r := range rows {
+		got[r.cloudChatID] = r.portalID
+	}
+	if got["chat-stay"] != shared {
+		t.Errorf("chat-stay moved to %q, want it left at %q", got["chat-stay"], shared)
+	}
+	if got["chat-move"] != diverged {
+		t.Errorf("chat-move is at %q, want %q", got["chat-move"], diverged)
+	}
+}
+
+// TestListGroupChatsReturnsEveryRowDeterministically: listGroupChats used to
+// SELECT DISTINCT portal_id with no ORDER BY and keep the first row per portal,
+// so when two chats shared a portal the winner depended on Postgres row order —
+// and re-keying rewrote the row, flipping the winner on the next startup. Every
+// row must now be returned, in a stable order.
+func TestListGroupChatsReturnsEveryRowDeterministically(t *testing.T) {
+	ctx := context.Background()
+	db := newTestSQLiteDB(t)
+	store := newCloudBackfillStore(db, testSQLLoginID)
+	if err := store.ensureSchema(ctx); err != nil {
+		t.Fatalf("ensureSchema: %v", err)
+	}
+
+	const shared = "tel:+15551111111,tel:+15552222222"
+	for _, id := range []string{"chat-b", "chat-a", "chat-c"} {
+		if err := store.upsertChat(ctx, id, "rec-"+id, "group-"+id, shared, "SMS",
+			nil, nil, []string{"tel:+15551111111", "tel:+15552222222"}, time.Now().UnixMilli()); err != nil {
+			t.Fatalf("upsertChat(%s): %v", id, err)
+		}
+	}
+
+	first, err := store.listGroupChats(ctx)
+	if err != nil {
+		t.Fatalf("listGroupChats: %v", err)
+	}
+	if len(first) != 3 {
+		t.Fatalf("listGroupChats returned %d rows, want all 3 sharing the portal: %#v", len(first), first)
+	}
+	var ids []string
+	for _, r := range first {
+		ids = append(ids, r.cloudChatID)
+	}
+	if !slicesEqual(ids, []string{"chat-a", "chat-b", "chat-c"}) {
+		t.Errorf("row order = %v, want sorted by portal_id then cloud_chat_id", ids)
+	}
+
+	// Rewriting a row (what a re-key does) must not change the order.
+	if err := store.reKeyChatRowPortalID(ctx, "chat-a", shared); err != nil {
+		t.Fatalf("reKeyChatRowPortalID: %v", err)
+	}
+	second, err := store.listGroupChats(ctx)
+	if err != nil {
+		t.Fatalf("listGroupChats: %v", err)
+	}
+	var ids2 []string
+	for _, r := range second {
+		ids2 = append(ids2, r.cloudChatID)
+	}
+	if !slicesEqual(ids, ids2) {
+		t.Errorf("row order changed after a row rewrite: %v then %v", ids, ids2)
+	}
+}
+
+func slicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
