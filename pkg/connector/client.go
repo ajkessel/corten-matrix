@@ -379,6 +379,13 @@ type IMClient struct {
 	statusKitInviteMu     sync.Mutex
 	statusKitNextInviteAt time.Time
 
+	// Cache of portals where a ghost for one of our own handles authored
+	// messages, so the member sync keeps those ghosts joined instead of
+	// kicking them every startup. See selfGhostRooms.
+	selfGhostRoomsMu     sync.Mutex
+	selfGhostRoomsCache  map[string]map[networkid.UserID]bool
+	selfGhostRoomsLoaded bool
+
 	// Contacts readiness gate for CloudKit message sync.
 	contactsReady     bool
 	contactsReadyLock sync.RWMutex
@@ -3893,6 +3900,10 @@ func (c *IMClient) handleParticipantChange(log zerolog.Logger, msg rustpushgo.Wr
 			}
 		}
 	}
+
+	// Own-handle ghosts that authored history here must survive the kick pass
+	// (see addSelfGhostMembers), same as on the GetChatInfo path.
+	c.addSelfGhostMembers(context.Background(), string(finalPortalKey.ID), memberMap)
 
 	// Queue a ChatInfoChange with the full member list so bridgev2 syncs
 	// the Matrix room membership (invites new members, kicks removed ones).
@@ -7603,6 +7614,11 @@ func (c *IMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*b
 				Membership: event.MembershipJoin,
 			}
 		}
+		// Keep the ghosts for our OWN handles that authored history here: an
+		// IsFromMe member syncs the double puppet and never the ghost, so
+		// IsFull would kick it ("User is not in remote chat") and forward
+		// backfill would re-join it — visible leave/join churn every startup.
+		c.addSelfGhostMembers(ctx, portalID, memberMap)
 		chatInfo.Members = &bridgev2.ChatMemberList{
 			IsFull:    true,
 			MemberMap: memberMap,
@@ -7719,6 +7735,11 @@ func (c *IMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*b
 			}
 		}
 
+		// Self-chats and DMs where one of our own handles authored messages:
+		// keep that handle's ghost in the list so IsFull doesn't evict it. This
+		// covers the self-chat's own "other user" too, which the block above
+		// deliberately skips.
+		c.addSelfGhostMembers(ctx, portalID, memberMap)
 		members := &bridgev2.ChatMemberList{
 			IsFull:      true,
 			OtherUserID: otherUser,
@@ -13337,7 +13358,7 @@ func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
 	synced := 0
 	for _, entry := range entries {
 		done := make(chan struct{})
-		chatInfo := c.chatDBInfoToBridgev2(entry.info)
+		chatInfo := c.chatDBInfoToBridgev2(entry.info, entry.portalKey.ID)
 		chatGUID := entry.chatGUID
 		isSms := entry.isSms
 		c.UserLogin.QueueRemoteEvent(&simplevent.ChatResync{
@@ -13402,7 +13423,9 @@ func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
 }
 
 // chatDBInfoToBridgev2 converts a chat.db ChatInfo to a bridgev2 ChatInfo.
-func (c *IMClient) chatDBInfoToBridgev2(info *imessage.ChatInfo) *bridgev2.ChatInfo {
+// chatPortalID is the portal key the caller will queue this info under; it is
+// needed to look up which own-handle ghosts authored history in the room.
+func (c *IMClient) chatDBInfoToBridgev2(info *imessage.ChatInfo, chatPortalID networkid.PortalID) *bridgev2.ChatInfo {
 	parsed := imessage.ParseIdentifier(info.JSONChatGUID)
 	if parsed.LocalID == "" {
 		parsed = info.Identifier
@@ -13442,6 +13465,9 @@ func (c *IMClient) chatDBInfoToBridgev2(info *imessage.ChatInfo) *bridgev2.ChatI
 				Membership:  event.MembershipJoin,
 			}
 		}
+		// Keep own-handle ghosts that authored history here (see
+		// addSelfGhostMembers); IsFull would otherwise kick them each resync.
+		c.addSelfGhostMembers(context.Background(), string(chatPortalID), members.MemberMap)
 		chatInfo.Members = members
 	} else {
 		chatInfo.Type = ptr.Ptr(database.RoomTypeDM)
@@ -13468,6 +13494,9 @@ func (c *IMClient) chatDBInfoToBridgev2(info *imessage.ChatInfo) *bridgev2.ChatI
 			}
 		}
 
+		// Same own-handle-ghost protection as the APNs path: covers the
+		// self-chat's own "other user", which the block above skips.
+		c.addSelfGhostMembers(context.Background(), portalID, memberMap)
 		members := &bridgev2.ChatMemberList{
 			IsFull:      true,
 			OtherUserID: otherUser,
