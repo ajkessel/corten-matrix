@@ -2494,10 +2494,9 @@ func (c *IMClient) dmFocusContactAvatar(ctx context.Context, portal *bridgev2.Po
 	if contact == nil || len(contact.Avatar) == 0 {
 		return nil
 	}
-	avatarHash := sha256.Sum256(contact.Avatar)
 	avatarData := contact.Avatar
 	return &bridgev2.Avatar{
-		ID: networkid.AvatarID(fmt.Sprintf("contact:%s:%s", portalID, hex.EncodeToString(avatarHash[:8]))),
+		ID: networkid.AvatarID(fmt.Sprintf("contact:%s:%s", portalID, avatarContentHash(contact.Avatar))),
 		Get: func(ctx context.Context) ([]byte, error) {
 			return avatarData, nil
 		},
@@ -7776,10 +7775,9 @@ func (c *IMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*b
 			localID := stripIdentifierPrefix(portalID)
 			if store := c.contactStore(); store != nil {
 				if contact, _ := store.GetContactInfo(localID); contact != nil && len(contact.Avatar) > 0 {
-					avatarHash := sha256.Sum256(contact.Avatar)
 					avatarData := contact.Avatar
 					chatInfo.Avatar = &bridgev2.Avatar{
-						ID: networkid.AvatarID(fmt.Sprintf("contact:%s:%s", portalID, hex.EncodeToString(avatarHash[:8]))),
+						ID: networkid.AvatarID(fmt.Sprintf("contact:%s:%s", portalID, avatarContentHash(contact.Avatar))),
 						Get: func(ctx context.Context) ([]byte, error) {
 							return avatarData, nil
 						},
@@ -7938,10 +7936,9 @@ func (c *IMClient) GetUserInfo(ctx context.Context, ghost *bridgev2.Ghost) (*bri
 			ui.Identifiers = append(ui.Identifiers, id)
 		}
 		if len(contact.Avatar) > 0 {
-			avatarHash := sha256.Sum256(contact.Avatar)
 			avatarData := contact.Avatar // capture for closure
 			ui.Avatar = &bridgev2.Avatar{
-				ID: networkid.AvatarID(fmt.Sprintf("contact:%s:%s", identifier, hex.EncodeToString(avatarHash[:8]))),
+				ID: networkid.AvatarID(fmt.Sprintf("contact:%s:%s", identifier, avatarContentHash(contact.Avatar))),
 				Get: func(ctx context.Context) ([]byte, error) {
 					return avatarData, nil
 				},
@@ -7982,8 +7979,38 @@ func (c *IMClient) GetUserInfo(ctx context.Context, ghost *bridgev2.Ghost) (*bri
 		return ui, nil
 	}
 
-	// No user-provided contact — fall back to a shared iMessage profile
-	// (Name & Photo Sharing / Me card) if one was received and cached.
+	// No contact matched. Before falling back to a LOWER-priority source, stop
+	// if the address book is merely unavailable rather than genuinely missing
+	// this handle, and this ghost already has a profile: overwriting it would
+	// churn, and the reconcile that runs when contacts land will write the
+	// authoritative profile anyway.
+	//
+	// Both fallbacks below downgrade a contact-resolved profile while contacts
+	// are cold, and both fan a member event into every room the ghost shares:
+	//   - the shared iMessage profile (Name & Photo Sharing): on every startup
+	//     applyCachedSharedProfilesToGhosts pushes cached profiles to ghosts
+	//     before the first CardDAV sync completes, so a ghost with both a
+	//     shared photo and an address-book photo had BOTH written seconds
+	//     apart — two uploads, two avatar_url PUTs, per restart.
+	//   - the raw identifier: the "real name ↔ Apple ID" display-name flip.
+	//
+	// Returning nil (not a UserInfo with nil fields) leaves the avatar alone
+	// too: bridgev2 treats a nil Avatar inside a non-nil UserInfo as "never
+	// expecting one" and latches AvatarSet on an empty MXC, which would freeze
+	// the contact photo (same trap as the AvatarURL branch above).
+	// UpdateInfoIfNecessary handles a nil return as "no info received".
+	//
+	// A ghost with no name yet still gets a fallback: a shared-profile name, or
+	// failing that a readable phone/email, beats rendering as a raw
+	// @corten_tel=3a... MXID in clients and push notifications.
+	if ghost.Name != "" && c.contactsDegraded() {
+		zerolog.Ctx(ctx).Debug().Str("ghost_id", string(ghost.ID)).
+			Msg("Contact cache unavailable — keeping existing ghost profile instead of falling back to a lower-priority source")
+		return nil, nil
+	}
+
+	// Fall back to a shared iMessage profile (Name & Photo Sharing / Me card)
+	// if one was received and cached.
 	if profile := c.lookupSharedProfile(identifier); profile != nil {
 		if profile.FirstName != "" || profile.LastName != "" || profile.DisplayName != "" {
 			name := c.Main.Config.FormatDisplayname(DisplaynameParams{
@@ -7995,9 +8022,8 @@ func (c *IMClient) GetUserInfo(ctx context.Context, ghost *bridgev2.Ghost) (*bri
 		}
 		if profile.Avatar != nil && len(*profile.Avatar) > 0 {
 			avatarData := *profile.Avatar
-			avatarHash := sha256.Sum256(avatarData)
 			ui.Avatar = &bridgev2.Avatar{
-				ID: networkid.AvatarID(fmt.Sprintf("improfile:%s:%s", identifier, hex.EncodeToString(avatarHash[:8]))),
+				ID: networkid.AvatarID(fmt.Sprintf("improfile:%s:%s", identifier, avatarContentHash(avatarData))),
 				Get: func(ctx context.Context) ([]byte, error) {
 					return avatarData, nil
 				},
@@ -8008,23 +8034,7 @@ func (c *IMClient) GetUserInfo(ctx context.Context, ghost *bridgev2.Ghost) (*bri
 		}
 	}
 
-	// Final fallback: format from identifier. Skip it entirely when the address
-	// book is degraded and this ghost ALREADY has a name — writing the raw
-	// handle over a resolved contact name is the display-name flip-flop, and it
-	// fans a member event into every room the ghost shares. Returning nil (not
-	// a UserInfo with Name==nil) leaves the avatar alone too: bridgev2 treats a
-	// nil Avatar inside a non-nil UserInfo as "never expecting one" and latches
-	// AvatarSet on an empty MXC, which would freeze the contact photo (same
-	// trap as the AvatarURL branch above). UpdateInfoIfNecessary handles a nil
-	// return as "no info received" and writes nothing.
-	//
-	// A ghost with no name yet still gets the fallback: a readable phone/email
-	// beats rendering as a raw @corten_tel=3a... MXID in clients and pushes.
-	if ghost.Name != "" && c.contactsDegraded() {
-		zerolog.Ctx(ctx).Debug().Str("ghost_id", string(ghost.ID)).
-			Msg("Contact cache unavailable — keeping existing ghost profile instead of falling back to the raw identifier")
-		return nil, nil
-	}
+	// Final fallback: format from identifier.
 	name := c.Main.Config.FormatDisplayname(identifierToDisplaynameParams(identifier))
 	ui.Name = &name
 	return ui, nil
@@ -13617,10 +13627,9 @@ func (c *IMClient) chatDBInfoToBridgev2(info *imessage.ChatInfo, chatPortalID ne
 			localID := stripIdentifierPrefix(portalID)
 			if store := c.contactStore(); store != nil {
 				if contact, _ := store.GetContactInfo(localID); contact != nil && len(contact.Avatar) > 0 {
-					avatarHash := sha256.Sum256(contact.Avatar)
 					avatarData := contact.Avatar
 					chatInfo.Avatar = &bridgev2.Avatar{
-						ID: networkid.AvatarID(fmt.Sprintf("contact:%s:%s", portalID, hex.EncodeToString(avatarHash[:8]))),
+						ID: networkid.AvatarID(fmt.Sprintf("contact:%s:%s", portalID, avatarContentHash(contact.Avatar))),
 						Get: func(ctx context.Context) ([]byte, error) {
 							return avatarData, nil
 						},
