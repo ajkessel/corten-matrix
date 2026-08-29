@@ -98,3 +98,28 @@ func TestDMNameRepairNeedsPush(t *testing.T) {
 		})
 	}
 }
+
+// TestDMNameRepairEnabled pins the config gate. Under private_chat_portal_meta:
+// false bridgev2 leaves DMs unnamed on purpose, so an absent name event is not
+// damage there — without this gate the sweep would push explicit titles into
+// every non-custom DM on those installs, which is why dmNameNeedsRepair("",
+// want) returning true is only ever reached with the setting on.
+func TestDMNameRepairEnabled(t *testing.T) {
+	cases := []struct {
+		name       string
+		pcpm, done bool
+		want       bool
+	}{
+		{"framework owns DM names, not yet run", true, false, true},
+		{"already recorded as done", true, true, false},
+		{"PCPM off: DMs are intentionally unnamed", false, false, false},
+		{"PCPM off and done", false, true, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := dmNameRepairEnabled(tc.pcpm, tc.done); got != tc.want {
+				t.Errorf("dmNameRepairEnabled(%v, %v) = %v, want %v", tc.pcpm, tc.done, got, tc.want)
+			}
+		})
+	}
+}

@@ -56,7 +56,23 @@ func (c *IMClient) repairDivergedDMRoomNames(log zerolog.Logger) {
 	log = log.With().Str("component", "dm_name_repair").Logger()
 	ctx := log.WithContext(context.Background())
 
-	if done := c.Main.Bridge.DB.KV.Get(ctx, dmNameRepairKey); done != "" {
+	// Only meaningful when the framework owns DM names. Under
+	// private_chat_portal_meta: false bridgev2 deliberately sets no
+	// m.room.name on a DM at all (UpdateInfoFromGhost and updateDMPortals both
+	// early-return), leaving clients to derive the title from the member. On
+	// such an install every non-custom DM would look like damage — an absent
+	// name event — and this sweep would seize up to a budget's worth of titles
+	// the framework intentionally left implicit.
+	if !dmNameRepairEnabled(c.Main.Bridge.Config.PrivateChatPortalMeta,
+		c.Main.Bridge.DB.KV.Get(ctx, dmNameRepairKey) != "") {
+		return
+	}
+	// Dispatched from setContactsReady, which fires on every contact-sync tick
+	// (~15 min), not just at startup. Without this a pass that ends with a
+	// permanently failing room — the bot lacking the power level for
+	// m.room.name, say — would never write the flag and would re-sweep every
+	// tick forever. One attempt per process; a genuine retry costs a restart.
+	if c.dmNameRepairRan.Swap(true) {
 		return
 	}
 	stateReader, ok := c.Main.Bridge.Matrix.(bridgev2.MatrixConnectorWithArbitraryRoomState)
@@ -136,26 +152,48 @@ func (c *IMClient) repairDivergedDMRoomNames(log zerolog.Logger) {
 			Bool("live_name_was_empty", liveName == "").
 			Msg("Repaired DM room name that had diverged from the bridge's stored name")
 
-		// Bring the row in line with what Matrix now holds, so the framework's
-		// early-return is telling the truth from here on.
-		if portal.Name != want || !portal.NameSet {
-			portal.Name = want
-			portal.NameSet = true
-			if err := portal.Save(ctx); err != nil {
-				log.Warn().Err(err).Str("portal_mxid", string(portal.MXID)).
-					Msg("Failed to save portal after repairing its room name")
-			}
-		}
+		// Deliberately NOT writing portal.Name/NameSet here.
+		// GetAllPortalsWithMXID hands back the bridge's CACHED *Portal
+		// instances, and lockedUpdateInfoFromGhost takes roomCreateLock (which
+		// this package cannot reach) precisely to serialize those fields — so
+		// mutating them here would race it. The push alone is the repair: the
+		// room now carries the ghost's name, which is what the stored row
+		// already claimed in every observed case. If a row does disagree, the
+		// framework's next ghost-driven update pushes the same value again,
+		// which is a no-op on the homeserver.
 	}
 
-	if failed > 0 {
+	if failed > 0 && repaired > 0 {
+		// Made progress but not cleanly: leave the flag unwritten so the next
+		// startup finishes the rest. The once-per-process guard above keeps
+		// that a per-restart retry rather than a per-tick one.
 		log.Info().Int("checked", checked).Int("repaired", repaired).Int("failed", failed).
 			Msg("DM name repair finished with failures — will retry on next startup")
 		return
 	}
+	if failed > 0 {
+		// Repaired nothing and still failed: the failures are structural (the
+		// bot lacking the power level for m.room.name, or no longer being in
+		// the room), so a retry would fail identically. Write the flag and stop
+		// sweeping thousands of rooms on every restart forever.
+		log.Warn().Int("checked", checked).Int("failed", failed).
+			Msg("DM name repair could not repair any room — recording it as done rather than retrying")
+	}
 	c.Main.Bridge.DB.KV.Set(ctx, dmNameRepairKey, time.Now().Format(time.RFC3339))
 	log.Info().Int("checked", checked).Int("repaired", repaired).
 		Msg("DM name repair complete")
+}
+
+// dmNameRepairEnabled reports whether the sweep should run at all.
+//
+// privateChatPortalMeta is load-bearing: with it off, bridgev2 deliberately
+// sets no m.room.name on DMs (UpdateInfoFromGhost and updateDMPortals both
+// early-return), so every non-custom DM would present as damage — an absent
+// name event — and the sweep would seize titles the framework intentionally
+// left for the client to derive. The divergence this repairs is created by the
+// implicit-name path, which only exists when the setting is on.
+func dmNameRepairEnabled(privateChatPortalMeta, alreadyDone bool) bool {
+	return privateChatPortalMeta && !alreadyDone
 }
 
 // dmNameRepairEligible reports whether a portal's room name is the framework's
