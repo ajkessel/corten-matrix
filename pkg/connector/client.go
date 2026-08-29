@@ -382,9 +382,10 @@ type IMClient struct {
 	// Cache of portals where a ghost for one of our own handles authored
 	// messages, so the member sync keeps those ghosts joined instead of
 	// kicking them every startup. See selfGhostRooms.
-	selfGhostRoomsMu     sync.Mutex
-	selfGhostRoomsCache  map[string]map[networkid.UserID]bool
-	selfGhostRoomsLoaded bool
+	selfGhostRoomsMu      sync.Mutex
+	selfGhostRoomsCache   map[string]map[networkid.UserID]bool
+	selfGhostRoomsLoaded  bool
+	selfGhostRoomsRetryAt time.Time
 
 	// Contacts readiness gate for CloudKit message sync.
 	contactsReady     bool
@@ -1468,6 +1469,10 @@ func (c *IMClient) Connect(ctx context.Context) {
 	go c.periodicPetRefresh(log)
 	go c.periodicStatusSharingReinvite(log)
 	go c.startSharedStreamsWatcher(log)
+
+	// Reload which rooms must keep a ghost for one of our own handles: the set
+	// is a per-connect snapshot, and a reconnect may have new rooms in it.
+	c.resetSelfGhostRooms()
 
 	// Ensure shared-profile schema and hydrate the in-memory cache from the
 	// DB. Runs on every bridge start so existing installs pick up the table

@@ -7,7 +7,9 @@ package connector
 
 import (
 	"context"
+	"strconv"
 	"strings"
+	"time"
 
 	"maunium.net/go/mautrix/bridgev2"
 	matrixfmt "maunium.net/go/mautrix/bridgev2/matrix"
@@ -27,6 +29,10 @@ import (
 // cannot appear in a bridge user ID (those are "tel:+…" / "mailto:…"), so it can
 // never collide with a real member.
 const selfGhostMemberKeySuffix = "\x00self-ghost"
+
+// selfGhostRoomsRetryCooldown throttles retries after a failed load, so a query
+// that fails does so once per cooldown rather than once per portal.
+const selfGhostRoomsRetryCooldown = 5 * time.Minute
 
 // selfGhostRooms returns the set of own-handle ghosts that have authored
 // messages in each portal, keyed by portal ID.
@@ -50,10 +56,11 @@ const selfGhostMemberKeySuffix = "\x00self-ghost"
 //     the wild on two shortcode DMs, where the message-only signal missed it and
 //     the member sync evicted it.
 //
-// Loaded once per connect rather than per portal: GetChatInfo runs for every
-// portal on a startup resync (thousands), and the answer only changes when an
-// own-handle ghost writes in or joins a NEW room — either way a live action that
-// joins the ghost anyway, and is picked up by the next load.
+// Loaded once per connect (resetSelfGhostRooms clears it) rather than per
+// portal: GetChatInfo runs for every portal on a startup resync (thousands), and
+// within a connect the answer only changes when an own-handle ghost writes in or
+// joins a NEW room — either way a live action that joins the ghost anyway, and
+// one the next connect's load picks up.
 func (c *IMClient) selfGhostRooms(ctx context.Context) map[string]map[networkid.UserID]bool {
 	c.selfGhostRoomsMu.Lock()
 	defer c.selfGhostRoomsMu.Unlock()
@@ -61,25 +68,27 @@ func (c *IMClient) selfGhostRooms(ctx context.Context) map[string]map[networkid.
 		return c.selfGhostRoomsCache
 	}
 
+	if !c.selfGhostRoomsRetryAt.IsZero() && time.Now().Before(c.selfGhostRoomsRetryAt) {
+		// A recent load failed. Don't re-run the query for every portal of a
+		// startup resync (thousands of calls); wait out the cooldown.
+		return nil
+	}
+
 	ownGhostIDs := c.ownGhostIDs()
 	if len(ownGhostIDs) == 0 {
 		c.selfGhostRoomsLoaded = true
 		return nil
 	}
-	ids := make([]string, 0, len(ownGhostIDs))
-	for _, id := range ownGhostIDs {
-		ids = append(ids, string(id))
-	}
 
-	rows, err := c.Main.Bridge.DB.Database.Query(ctx,
-		`SELECT DISTINCT room_id, sender_id FROM message
-		 WHERE bridge_id=$1 AND room_receiver=$2 AND sender_id = ANY($3)`,
-		c.Main.Bridge.ID, c.UserLogin.ID, ids,
-	)
+	query, args := buildSelfGhostRoomsQuery(c.Main.Bridge.ID, c.UserLogin.ID, ownGhostIDs)
+	rows, err := c.Main.Bridge.DB.Database.Query(ctx, query, args...)
 	if err != nil {
-		// Leave the cache unloaded so the next call retries: failing open here
-		// means the member sync would evict own-handle ghosts again.
-		c.UserLogin.Log.Warn().Err(err).Msg("Failed to load rooms where own-handle ghosts authored messages")
+		// Back off instead of failing open per portal: without the keep set the
+		// member sync evicts own-handle ghosts again, but re-running a failing
+		// query once per GetChatInfo would do that thousands of times a startup.
+		c.selfGhostRoomsRetryAt = time.Now().Add(selfGhostRoomsRetryCooldown)
+		c.UserLogin.Log.Warn().Err(err).Dur("retry_in", selfGhostRoomsRetryCooldown).
+			Msg("Failed to load rooms where own-handle ghosts authored messages")
 		return nil
 	}
 	defer rows.Close()
@@ -97,6 +106,7 @@ func (c *IMClient) selfGhostRooms(ctx context.Context) map[string]map[networkid.
 		result[roomID][networkid.UserID(senderID)] = true
 	}
 	if err := rows.Err(); err != nil {
+		c.selfGhostRoomsRetryAt = time.Now().Add(selfGhostRoomsRetryCooldown)
 		c.UserLogin.Log.Warn().Err(err).Msg("Own-handle ghost room row iteration error")
 		return nil
 	}
@@ -111,6 +121,37 @@ func (c *IMClient) selfGhostRooms(ctx context.Context) map[string]map[networkid.
 		Int("from_authored_messages", authored).
 		Msg("Loaded portals whose member list must keep a ghost for one of our own handles")
 	return result
+}
+
+// buildSelfGhostRoomsQuery returns the authored-messages lookup and its binds.
+//
+// The handle list is expanded into explicit placeholders rather than passed to
+// "= ANY($3)": ANY is Postgres-only — SQLite answers "no such function: ANY" —
+// and SQLite is a first-class backend here. dbutil rewrites "$N" to "?N" for
+// SQLite, so numbered placeholders are portable as long as the list is expanded
+// rather than bound as one array. Own handles number a handful, so the IN list
+// stays tiny.
+func buildSelfGhostRoomsQuery(bridgeID networkid.BridgeID, loginID networkid.UserLoginID, ghostIDs []networkid.UserID) (string, []any) {
+	args := make([]any, 0, len(ghostIDs)+2)
+	args = append(args, bridgeID, loginID)
+	placeholders := make([]string, len(ghostIDs))
+	for i, id := range ghostIDs {
+		placeholders[i] = "$" + strconv.Itoa(i+3)
+		args = append(args, string(id))
+	}
+	return `SELECT DISTINCT room_id, sender_id FROM message
+		 WHERE bridge_id=$1 AND room_receiver=$2 AND sender_id IN (` + strings.Join(placeholders, ", ") + `)`, args
+}
+
+// resetSelfGhostRooms drops the cached keep set so the next lookup reloads it.
+// Called from Connect: without this the set is loaded once per PROCESS, and a
+// reconnect (or a re-login) would keep serving a snapshot from before it.
+func (c *IMClient) resetSelfGhostRooms() {
+	c.selfGhostRoomsMu.Lock()
+	c.selfGhostRoomsCache = nil
+	c.selfGhostRoomsLoaded = false
+	c.selfGhostRoomsRetryAt = time.Time{}
+	c.selfGhostRoomsMu.Unlock()
 }
 
 // mergeSelfGhostRooms folds src into dst, unioning the ghost sets per portal, and

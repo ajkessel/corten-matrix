@@ -207,7 +207,7 @@ func TestMergeSelfGhostRooms(t *testing.T) {
 		// Same portal, ghost already known: no change.
 		"tel:+15559999999": {tel: true},
 		// Joined but silent — the gap this signal closes.
-		"tel:+18886163241": {tel: true},
+		"tel:+15558675309": {tel: true},
 		// Another own handle joined to a portal we already track.
 		"mailto:me@example.com": {mail: true},
 	}
@@ -216,7 +216,7 @@ func TestMergeSelfGhostRooms(t *testing.T) {
 	if len(got) != 3 {
 		t.Fatalf("merged portals = %d, want 3: %#v", len(got), got)
 	}
-	if !got["tel:+18886163241"][tel] {
+	if !got["tel:+15558675309"][tel] {
 		t.Error("joined-but-silent portal missing from the union — the ghost would be evicted again")
 	}
 	if !got["mailto:me@example.com"][tel] || !got["mailto:me@example.com"][mail] {
@@ -236,11 +236,67 @@ func TestMergeSelfGhostRoomsEmptySides(t *testing.T) {
 	if got := mergeSelfGhostRooms(authored, nil); len(got) != 1 || !got["tel:+15559999999"][tel] {
 		t.Errorf("merge with no joined-rooms data = %#v, want the authored set unchanged", got)
 	}
-	joined := map[string]map[networkid.UserID]bool{"tel:+18886163241": {tel: true}}
-	if got := mergeSelfGhostRooms(nil, joined); len(got) != 1 || !got["tel:+18886163241"][tel] {
+	joined := map[string]map[networkid.UserID]bool{"tel:+15558675309": {tel: true}}
+	if got := mergeSelfGhostRooms(nil, joined); len(got) != 1 || !got["tel:+15558675309"][tel] {
 		t.Errorf("merge into a nil authored set = %#v, want the joined set", got)
 	}
 	if got := mergeSelfGhostRooms(nil, nil); len(got) != 0 {
 		t.Errorf("merge of two empty sets = %#v, want empty", got)
+	}
+}
+
+// TestSelfGhostRoomsQueryRunsOnSQLite is the regression test for a
+// Postgres-only query shipping into a repo where SQLite is a first-class
+// backend. The original used `sender_id = ANY($3)`, which SQLite rejects with
+// "no such function: ANY" — and because the error path returned before marking
+// the cache loaded, it re-failed once per GetChatInfo call, so on SQLite
+// installs the leave/rejoin churn this file exists to stop was simply not
+// fixed. Executing the real statement is the only way to catch that.
+func TestSelfGhostRoomsQueryRunsOnSQLite(t *testing.T) {
+	ctx := context.Background()
+	db := newTestSQLiteDB(t)
+	if _, err := db.Exec(ctx, `CREATE TABLE message (
+		bridge_id TEXT, room_id TEXT, room_receiver TEXT, sender_id TEXT
+	)`); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	rows := []struct{ bridge, room, receiver, sender string }{
+		{"corten", "tel:+15550000001", "D:1", "tel:+15551234567"},      // own handle, keep
+		{"corten", "tel:+15550000001", "D:1", "tel:+15559999999"},      // peer, ignore
+		{"corten", "tel:+15550000002", "D:1", "mailto:me@example.com"}, // other own handle
+		{"corten", "tel:+15550000003", "D:2", "tel:+15551234567"},      // another login, ignore
+		{"other", "tel:+15550000004", "D:1", "tel:+15551234567"},       // another bridge, ignore
+	}
+	for _, r := range rows {
+		if _, err := db.Exec(ctx, `INSERT INTO message (bridge_id, room_id, room_receiver, sender_id) VALUES ($1, $2, $3, $4)`,
+			r.bridge, r.room, r.receiver, r.sender); err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+	}
+
+	query, args := buildSelfGhostRoomsQuery("corten", "D:1",
+		[]networkid.UserID{makeUserID("tel:+15551234567"), makeUserID("mailto:me@example.com")})
+	res, err := db.Query(ctx, query, args...)
+	if err != nil {
+		t.Fatalf("query failed on SQLite: %v", err)
+	}
+	defer res.Close()
+
+	got := map[string]string{}
+	for res.Next() {
+		var room, sender string
+		if err := res.Scan(&room, &sender); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		got[room] = sender
+	}
+	if err := res.Err(); err != nil {
+		t.Fatalf("iterate: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d portals, want 2 (own handles in this bridge+login only): %#v", len(got), got)
+	}
+	if got["tel:+15550000001"] != "tel:+15551234567" || got["tel:+15550000002"] != "mailto:me@example.com" {
+		t.Errorf("unexpected result set: %#v", got)
 	}
 }
