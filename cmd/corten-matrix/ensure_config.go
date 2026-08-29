@@ -9,12 +9,19 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
+	"maunium.net/go/mautrix/bridgev2/matrix/mxmain"
 
 	"github.com/lrhodin/corten-matrix/pkg/imconfig"
 )
@@ -127,12 +134,21 @@ func ensureNetworkConfigKeys(configPath string) {
 
 // mappingValue returns the value node for key in a YAML mapping node, or nil.
 func mappingValue(mapping *yaml.Node, key string) *yaml.Node {
+	_, value := mappingEntry(mapping, key)
+	return value
+}
+
+// mappingEntry returns both the key and value nodes for key in a YAML mapping,
+// or nils. The key node is what carries the parent line: for a block mapping
+// yaml.v3 reports the *value* node's Line as its first child's line, so the
+// `foo:` line itself is only reachable through the key node.
+func mappingEntry(mapping *yaml.Node, key string) (keyNode, value *yaml.Node) {
 	for i := 0; i+1 < len(mapping.Content); i += 2 {
 		if mapping.Content[i].Value == key {
-			return mapping.Content[i+1]
+			return mapping.Content[i], mapping.Content[i+1]
 		}
 	}
-	return nil
+	return nil, nil
 }
 
 // maxNodeLine returns the largest source line number anywhere in the subtree,
@@ -220,4 +236,220 @@ func atomicWriteConfig(path string, data []byte) error {
 		return err
 	}
 	return nil
+}
+
+// masAuthMetadataPath is the MSC2965 authentication metadata document. Synapse
+// only serves it when authentication is delegated to Matrix Authentication
+// Service (next-gen auth / MSC3861), which makes it a reliable MAS probe.
+const masAuthMetadataPath = "/_matrix/client/v1/auth_metadata"
+
+// ensureMASCompatibility turns on encryption.msc4190 when the homeserver has
+// moved to next-gen auth (Matrix Authentication Service).
+//
+// Under MAS, Synapse stops serving /login altogether, so the framework's legacy
+// bridge-bot device creation (m.login.application_service) fails and the bridge
+// dies with "homeserver does not support appservice login" on every start.
+// mautrix already ships the replacement — MSC4190's
+// PUT /_matrix/client/v3/devices/{deviceID} — but only behind
+// encryption.msc4190, which nothing in our setup flow used to set. So a working
+// bridge breaks the moment the operator migrates their homeserver to MAS, with
+// an error that doesn't say what to change.
+//
+// Detection is one GET of the MSC2965 metadata document. Anything other than a
+// 200 — including any network error — is treated as "not MAS" and leaves the
+// config completely untouched: a probe must never be able to block startup.
+//
+// Same conservative rules as ensureNetworkConfigKeys: a config that doesn't
+// parse is left alone, the YAML tree is never re-serialized (only the one
+// scalar line is rewritten, so comments and formatting survive), the write is
+// atomic, and it is idempotent.
+//
+// Synapse 1.141+ needs nothing else: PUT /devices/{deviceID} creates the device
+// for any appservice (rest/client/devices.py branches on requester.app_service_id
+// and never consults the registration flag). Older Synapse also wants
+// io.element.msc4190 in the appservice registration, which lives on the
+// homeserver and can't be set from here — hence the printed note rather than a
+// silent assumption either way.
+func ensureMASCompatibility(br *mxmain.BridgeMain) {
+	if br.Config == nil || !br.Config.Encryption.Allow || br.Config.Encryption.MSC4190 {
+		return
+	}
+	if !homeserverUsesMAS(br.Config.Homeserver.Address) {
+		return
+	}
+
+	// Apply in memory too, so the fix takes effect on this run and not only
+	// after the next restart.
+	br.Config.Encryption.MSC4190 = true
+	fmt.Fprintf(os.Stderr, "Homeserver uses Matrix Authentication Service (next-gen auth) — "+
+		"enabled encryption.msc4190 so the bridge bot device is created via MSC4190 "+
+		"instead of appservice login\n")
+	if br.ConfigPath != "" {
+		if err := setMSC4190OnDisk(br.ConfigPath); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not persist encryption.msc4190 to %s: %v\n",
+				br.ConfigPath, err)
+		}
+	}
+	fmt.Fprintf(os.Stderr, "If your homeserver is older than Synapse 1.141, also add "+
+		"`io.element.msc4190: true` to this bridge's appservice registration and restart the "+
+		"homeserver — otherwise creating the bot device will fail. Synapse 1.141+ needs nothing "+
+		"further. See https://docs.mau.fi/bridges/general/end-to-bridge-encryption.html\n")
+}
+
+// homeserverUsesMAS reports whether the homeserver delegates authentication to
+// Matrix Authentication Service. Errors mean "unknown", which is reported as
+// false so a transient network problem can never flip the config.
+//
+// A 200 is not by itself proof: an intermediary that answers 200 for unknown
+// paths (a `try_files ... /index.html` catch-all in front of the homeserver, or
+// a proxy redirecting unknown /_matrix paths to a login page) would otherwise
+// read as MAS. So the body has to parse as the MSC2965 metadata document, whose
+// `issuer` field is required by the spec.
+func homeserverUsesMAS(address string) bool {
+	if address == "" {
+		return false
+	}
+	base, err := url.Parse(address)
+	if err != nil || base.Host == "" {
+		return false
+	}
+	base.Path = strings.TrimSuffix(base.Path, "/") + masAuthMetadataPath
+	base.RawQuery = ""
+	base.Fragment = ""
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base.String(), nil)
+	if err != nil {
+		return false
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return false
+	}
+	var meta struct {
+		Issuer string `json:"issuer"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&meta); err != nil {
+		return false
+	}
+	return meta.Issuer != ""
+}
+
+// setMSC4190OnDisk sets encryption.msc4190 to true in the config file, editing
+// only that one line (or splicing the key in if an older config predates it).
+// The parsed tree is used solely to locate the line and is never marshalled
+// back out.
+func setMSC4190OnDisk(configPath string) error {
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return err
+	}
+	var root yaml.Node
+	if err := yaml.Unmarshal(data, &root); err != nil {
+		return fmt.Errorf("config does not parse, leaving it untouched: %w", err)
+	}
+	if len(root.Content) == 0 || root.Content[0].Kind != yaml.MappingNode {
+		return fmt.Errorf("unexpected config structure")
+	}
+	encryptionKey, encryption := mappingEntry(root.Content[0], "encryption")
+	if encryption == nil || encryption.Kind != yaml.MappingNode || len(encryption.Content) == 0 {
+		return fmt.Errorf("no encryption block in config")
+	}
+	lines := strings.Split(string(data), "\n")
+
+	if node := mappingValue(encryption, "msc4190"); node != nil {
+		if node.Kind != yaml.ScalarNode {
+			return fmt.Errorf("encryption.msc4190 is not a scalar")
+		}
+		if node.Value == "true" {
+			return nil // already set on disk
+		}
+		if node.Line < 1 || node.Line > len(lines) {
+			return fmt.Errorf("encryption.msc4190 line %d out of range", node.Line)
+		}
+		updated, ok := setScalarInLine(lines[node.Line-1], "msc4190", "true")
+		if !ok {
+			return fmt.Errorf("could not rewrite line %d (%q)", node.Line, lines[node.Line-1])
+		}
+		lines[node.Line-1] = updated
+		return atomicWriteConfig(configPath, []byte(strings.Join(lines, "\n")))
+	}
+
+	// Key absent (config predates the framework option, e.g. when the bridge
+	// runs with --no-update): splice it in as the encryption block's first key,
+	// matching that block's existing indentation.
+	//
+	// That only works for a block mapping. In `encryption: {allow: true}` the
+	// first key shares a line with the parent key, so a spliced line would land
+	// in whatever block precedes it and produce a config that no longer parses
+	// — the one thing this function must never do. Note that comparing line
+	// numbers does not distinguish the two: yaml.v3 reports a block mapping's
+	// Line as its first key's line, so Content[0].Line == encryption.Line holds
+	// for block style too. Only the style flag tells them apart.
+	if encryption.Style&yaml.FlowStyle != 0 {
+		return fmt.Errorf("encryption block is flow-style; add `msc4190: true` to it manually")
+	}
+	// Indent from the block's first key, but insert directly below the
+	// `encryption:` line rather than above that key: keys in a generated config
+	// each carry a leading comment, and splicing above the key would sit between
+	// that comment and the key it documents, silently reassigning it to
+	// msc4190. This also matches where the install scripts insert.
+	indent := strings.Repeat(" ", encryption.Content[0].Column-1)
+	after := encryptionKey.Line // insert on the line after `encryption:`
+	if after < 1 || after > len(lines) {
+		return fmt.Errorf("encryption block line %d out of range", encryptionKey.Line)
+	}
+	out := make([]string, 0, len(lines)+1)
+	out = append(out, lines[:after]...)
+	out = append(out, indent+"msc4190: true")
+	out = append(out, lines[after:]...)
+	return atomicWriteConfig(configPath, []byte(strings.Join(out, "\n")))
+}
+
+// setScalarInLine replaces the value of a `key: value` config line. Everything
+// around the value — indentation, the spacing after the colon, and any trailing
+// comment together with the whitespace in front of it — is preserved byte for
+// byte, so rewriting a value never reflows the file.
+//
+// Comment detection follows YAML: `#` only opens a comment at the start of a
+// line or after whitespace, so a `#` inside a value (`key: "a#b"`) is left
+// alone rather than being mistaken for a trailing comment.
+func setScalarInLine(line, key, value string) (string, bool) {
+	idx := strings.Index(line, key+":")
+	if idx < 0 || strings.TrimSpace(line[:idx]) != "" {
+		return "", false
+	}
+	rest := line[idx+len(key)+1:]
+	lead := rest[:len(rest)-len(strings.TrimLeft(rest, " \t"))]
+	if lead == "" {
+		lead = " "
+	}
+	gap, comment := "", ""
+	if c := inlineCommentIndex(rest); c >= 0 {
+		beforeComment := rest[:c]
+		gap = beforeComment[len(strings.TrimRight(beforeComment, " \t")):]
+		comment = rest[c:]
+	}
+	return line[:idx] + key + ":" + lead + value + gap + comment, true
+}
+
+// inlineCommentIndex returns the index of the `#` that opens a trailing comment
+// in the value portion of a config line, or -1 if there is none. Per YAML, that
+// requires the `#` to be preceded by whitespace.
+func inlineCommentIndex(valuePart string) int {
+	for i, r := range valuePart {
+		if r != '#' {
+			continue
+		}
+		if i == 0 || valuePart[i-1] == ' ' || valuePart[i-1] == '\t' {
+			return i
+		}
+	}
+	return -1
 }

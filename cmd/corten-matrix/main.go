@@ -250,6 +250,11 @@ func main() {
 	// repair broken permissions before validateConfig() runs in Init().
 	m.PreInit()
 	ensureSecureDeleteDSN(&m)
+	// Homeservers that moved to Matrix Authentication Service no longer serve
+	// appservice login, so the bot device has to be created with MSC4190
+	// instead. Detect that and flip encryption.msc4190 before Init() builds the
+	// Matrix connector. See ensure_config.go.
+	ensureMASCompatibility(&m)
 	repairPermissions(&m)
 	migrateDatabaseOwner(&m)
 	m.Init()
