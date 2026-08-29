@@ -3879,6 +3879,18 @@ type groupRowReKey struct {
 	cloudChatID string
 	from        string
 	to          string
+	// carryOrphans moves the rows that belong to `from` but carry no chat_id
+	// along with this conversation. The realtime paths (persistMessageUUID,
+	// persistTapbackUUID) write cloud_message rows with portal_id but NULL
+	// chat_id, so a strictly chat-scoped re-key strands them under the old key
+	// — where portal-scoped reads (backfill window bounds, the read-receipt
+	// heuristic, purges) still pick them up or miss them.
+	//
+	// Only set when it is unambiguous: every conversation under `from` is
+	// moving to the same target, so the orphans can only belong to this one.
+	// When conversations split, the orphans stay with the room that keeps the
+	// key rather than following an arbitrary winner.
+	carryOrphans bool
 }
 
 // groupConsolidationPlan separates the two kinds of work: per-conversation
@@ -3935,11 +3947,17 @@ func planGroupConsolidation(entries []groupConsolidationEntry) groupConsolidatio
 		canonicals := make(map[string]bool, len(rows))
 		for _, r := range rows {
 			canonicals[r.canonical] = true
+		}
+		// Orphaned (chat_id-less) rows can follow only when this portal's
+		// conversations all agree on one destination — see carryOrphans.
+		soleTarget := len(canonicals) == 1 && !canonicals[portalID]
+		for _, r := range rows {
 			if r.canonical != portalID && r.cloudChatID != "" {
 				plan.rowReKeys = append(plan.rowReKeys, groupRowReKey{
-					cloudChatID: r.cloudChatID,
-					from:        portalID,
-					to:          r.canonical,
+					cloudChatID:  r.cloudChatID,
+					from:         portalID,
+					to:           r.canonical,
+					carryOrphans: soleTarget,
 				})
 			}
 		}
@@ -4195,7 +4213,12 @@ func planGroupRoomMoves(canonical string, canonicalHasRoom bool, members []group
 // re-inviting the difference every restart.
 func (c *IMClient) reKeyGroupCloudRows(ctx context.Context, log zerolog.Logger, reKeys []groupRowReKey) {
 	for _, rk := range reKeys {
-		if err := c.cloudStore.reKeyChatRowPortalID(ctx, rk.cloudChatID, rk.to); err != nil {
+		if rk.from == rk.to {
+			// The planner never emits one, but a self-re-key would clear
+			// fwd_backfill_done and bump updated_ts for nothing.
+			continue
+		}
+		if err := c.cloudStore.reKeyChatRowPortalID(ctx, rk.cloudChatID, rk.from, rk.to, rk.carryOrphans); err != nil {
 			log.Warn().Err(err).
 				Str("cloud_chat_id", rk.cloudChatID).
 				Str("old_portal_id", rk.from).

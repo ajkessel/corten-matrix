@@ -2462,7 +2462,7 @@ func (s *cloudBackfillStore) orphanedGroupRoomPortalIDs(ctx context.Context, bri
 // to newPortalID and resets forward-backfill state so the re-keyed messages
 // re-backfill into the new portal's room. updated_ts is bumped so the portal
 // isn't skipped by the "fully backfilled, no new content" startup filter.
-// Mirrors the normalizeGroup*PortalIDs migrations. No-op-safe.
+// Mirrors the normalizeGroup*PortalIDs migrations.
 // reKeyChatRowPortalID re-keys ONE chat's rows to a new portal ID, matched by
 // cloud_chat_id rather than by the old portal ID.
 //
@@ -2471,8 +2471,8 @@ func (s *cloudBackfillStore) orphanedGroupRoomPortalIDs(ctx context.Context, bri
 // a key its own roster disagrees with, and then demanded its own key back on the
 // next startup — the group-membership flip-flop. Splitting by chat lets each
 // conversation settle on the key its roster actually implies.
-func (s *cloudBackfillStore) reKeyChatRowPortalID(ctx context.Context, cloudChatID, newPortalID string) error {
-	if cloudChatID == "" || newPortalID == "" {
+func (s *cloudBackfillStore) reKeyChatRowPortalID(ctx context.Context, cloudChatID, oldPortalID, newPortalID string, carryOrphans bool) error {
+	if cloudChatID == "" || newPortalID == "" || oldPortalID == newPortalID {
 		return nil
 	}
 	nowMS := time.Now().UnixMilli()
@@ -2487,6 +2487,25 @@ func (s *cloudBackfillStore) reKeyChatRowPortalID(ctx context.Context, cloudChat
 		`UPDATE cloud_message SET portal_id=$3, updated_ts=$4
 		 WHERE login_id=$1 AND chat_id=$2`,
 		s.loginID, cloudChatID, newPortalID, nowMS,
+	); err != nil {
+		return err
+	}
+	if !carryOrphans || oldPortalID == "" {
+		return nil
+	}
+	// The realtime paths (persistMessageUUID, persistTapbackUUID) insert
+	// cloud_message rows with a portal_id and no chat_id, so chat-scoped
+	// matching alone strands them under the old key — where portal-scoped
+	// reads still count them: getOldestMessageTimestamp /
+	// getNewestMessageTimestamp bound the backfill window,
+	// portalHasPreStartupOutgoingMessages drives read-receipt re-delivery, and
+	// the portal purge would leave them behind. The caller only sets
+	// carryOrphans when every conversation under the old key moves to the same
+	// target, so these rows can only belong to this one.
+	if _, err := s.db.Exec(ctx,
+		`UPDATE cloud_message SET portal_id=$3, updated_ts=$4
+		 WHERE login_id=$1 AND portal_id=$2 AND (chat_id IS NULL OR chat_id='')`,
+		s.loginID, oldPortalID, newPortalID, nowMS,
 	); err != nil {
 		return err
 	}

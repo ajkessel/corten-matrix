@@ -26,9 +26,9 @@ func TestPlanGroupConsolidation(t *testing.T) {
 				{canonical: comma, members: []string{"gid:aaaa", "gid:bbbb", "gid:cccc"}},
 			},
 			wantRows: []groupRowReKey{
-				{cloudChatID: "c1", from: "gid:aaaa", to: comma},
-				{cloudChatID: "c2", from: "gid:bbbb", to: comma},
-				{cloudChatID: "c3", from: "gid:cccc", to: comma},
+				{cloudChatID: "c1", from: "gid:aaaa", to: comma, carryOrphans: true},
+				{cloudChatID: "c2", from: "gid:bbbb", to: comma, carryOrphans: true},
+				{cloudChatID: "c3", from: "gid:cccc", to: comma, carryOrphans: true},
 			},
 		},
 		{
@@ -39,7 +39,7 @@ func TestPlanGroupConsolidation(t *testing.T) {
 			wantRoom: []groupConsolidationGroup{
 				{canonical: comma, members: []string{"gid:aaaa"}},
 			},
-			wantRows: []groupRowReKey{{cloudChatID: "c1", from: "gid:aaaa", to: comma}},
+			wantRows: []groupRowReKey{{cloudChatID: "c1", from: "gid:aaaa", to: comma, carryOrphans: true}},
 		},
 		{
 			name: "already-canonical single portal is a no-op",
@@ -58,7 +58,7 @@ func TestPlanGroupConsolidation(t *testing.T) {
 			wantRoom: []groupConsolidationGroup{
 				{canonical: comma, members: []string{"gid:aaaa"}},
 			},
-			wantRows: []groupRowReKey{{cloudChatID: "c2", from: "gid:aaaa", to: comma}},
+			wantRows: []groupRowReKey{{cloudChatID: "c2", from: "gid:aaaa", to: comma, carryOrphans: true}},
 		},
 		{
 			name: "distinct participant sets stay separate",
@@ -73,10 +73,10 @@ func TestPlanGroupConsolidation(t *testing.T) {
 				{canonical: commaB, members: []string{"gid:cccc", "gid:dddd"}},
 			},
 			wantRows: []groupRowReKey{
-				{cloudChatID: "c1", from: "gid:aaaa", to: comma},
-				{cloudChatID: "c2", from: "gid:bbbb", to: comma},
-				{cloudChatID: "c3", from: "gid:cccc", to: commaB},
-				{cloudChatID: "c4", from: "gid:dddd", to: commaB},
+				{cloudChatID: "c1", from: "gid:aaaa", to: comma, carryOrphans: true},
+				{cloudChatID: "c2", from: "gid:bbbb", to: comma, carryOrphans: true},
+				{cloudChatID: "c3", from: "gid:cccc", to: commaB, carryOrphans: true},
+				{cloudChatID: "c4", from: "gid:dddd", to: commaB, carryOrphans: true},
 			},
 		},
 		{
@@ -93,6 +93,8 @@ func TestPlanGroupConsolidation(t *testing.T) {
 				{cloudChatID: "stay", portalID: comma, canonical: comma},
 				{cloudChatID: "diverged", portalID: comma, canonical: commaB},
 			},
+			// carryOrphans stays false: a conversation still claims this portal,
+			// so chat_id-less rows can't be attributed to the one leaving.
 			wantRows: []groupRowReKey{{cloudChatID: "diverged", from: comma, to: commaB}},
 		},
 		{
@@ -122,9 +124,9 @@ func TestPlanGroupConsolidation(t *testing.T) {
 				{canonical: comma, members: []string{"gid:aaaa", "gid:bbbb"}},
 			},
 			wantRows: []groupRowReKey{
-				{cloudChatID: "c1", from: "gid:aaaa", to: comma},
-				{cloudChatID: "c1", from: "gid:aaaa", to: comma},
-				{cloudChatID: "c2", from: "gid:bbbb", to: comma},
+				{cloudChatID: "c1", from: "gid:aaaa", to: comma, carryOrphans: true},
+				{cloudChatID: "c1", from: "gid:aaaa", to: comma, carryOrphans: true},
+				{cloudChatID: "c2", from: "gid:bbbb", to: comma, carryOrphans: true},
 			},
 		},
 		{

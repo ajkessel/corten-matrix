@@ -1155,7 +1155,9 @@ func TestReKeyChatRowPortalIDLeavesSharedPortalSiblings(t *testing.T) {
 		}
 	}
 
-	if err := store.reKeyChatRowPortalID(ctx, "chat-move", diverged); err != nil {
+	// carryOrphans=false: two conversations share this portal, so chat_id-less
+	// rows can't be attributed and must stay put.
+	if err := store.reKeyChatRowPortalID(ctx, "chat-move", shared, diverged, false); err != nil {
 		t.Fatalf("reKeyChatRowPortalID: %v", err)
 	}
 
@@ -1211,9 +1213,10 @@ func TestListGroupChatsReturnsEveryRowDeterministically(t *testing.T) {
 		t.Errorf("row order = %v, want sorted by portal_id then cloud_chat_id", ids)
 	}
 
-	// Rewriting a row (what a re-key does) must not change the order.
-	if err := store.reKeyChatRowPortalID(ctx, "chat-a", shared); err != nil {
-		t.Fatalf("reKeyChatRowPortalID: %v", err)
+	// Rewriting rows in place (what a re-key or a roster refresh does) must not
+	// change the order — that heap movement is what made the winner flip.
+	if err := store.updateChatParticipants(ctx, shared, []string{"tel:+15551111111", "tel:+15552222222", "tel:+15553333333"}); err != nil {
+		t.Fatalf("updateChatParticipants: %v", err)
 	}
 	second, err := store.listGroupChats(ctx)
 	if err != nil {
@@ -1238,4 +1241,68 @@ func slicesEqual(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// TestReKeyChatRowCarriesOrphanRowsWhenUnambiguous covers the rows the realtime
+// paths write: persistMessageUUID and persistTapbackUUID set portal_id but no
+// chat_id, so a strictly chat-scoped re-key strands them under the old key —
+// where portal-scoped reads (backfill window bounds, the read-receipt
+// heuristic, the portal purge) still find them. They may only follow when the
+// destination is unambiguous.
+func TestReKeyChatRowCarriesOrphanRowsWhenUnambiguous(t *testing.T) {
+	ctx := context.Background()
+	db := newTestSQLiteDB(t)
+	store := newCloudBackfillStore(db, testSQLLoginID)
+	if err := store.ensureSchema(ctx); err != nil {
+		t.Fatalf("ensureSchema: %v", err)
+	}
+
+	const from = "gid:aaaa"
+	const to = "tel:+15551111111,tel:+15552222222"
+	seed := func(guid, chatID string) {
+		t.Helper()
+		if chatID == "" {
+			if err := store.persistMessageUUID(ctx, guid, from, time.Now().UnixMilli(), false); err != nil {
+				t.Fatalf("persistMessageUUID(%s): %v", guid, err)
+			}
+			return
+		}
+		if err := store.upsertMessageBatch(ctx, []cloudMessageRow{{GUID: guid, CloudChatID: chatID, PortalID: from,
+			TimestampMS: time.Now().UnixMilli(), RecordName: "rec-" + guid}}); err != nil {
+			t.Fatalf("upsertMessageBatch(%s): %v", guid, err)
+		}
+	}
+	seed("chat-scoped", "chat-1")
+	seed("orphan", "")
+
+	portalOf := func(guid string) string {
+		t.Helper()
+		var portal string
+		if err := db.QueryRow(ctx, `SELECT portal_id FROM cloud_message WHERE login_id=$1 AND guid=$2`,
+			testSQLLoginID, guid).Scan(&portal); err != nil {
+			t.Fatalf("read %s: %v", guid, err)
+		}
+		return portal
+	}
+
+	// Ambiguous: another conversation still lives under `from`, so the orphan
+	// can't be attributed and must stay.
+	if err := store.reKeyChatRowPortalID(ctx, "chat-1", from, to, false); err != nil {
+		t.Fatalf("reKeyChatRowPortalID: %v", err)
+	}
+	if got := portalOf("chat-scoped"); got != to {
+		t.Errorf("chat-scoped row at %q, want %q", got, to)
+	}
+	if got := portalOf("orphan"); got != from {
+		t.Errorf("orphan row moved to %q with carryOrphans=false, want it left at %q", got, from)
+	}
+
+	// Unambiguous: this conversation is the only one leaving, so the orphan
+	// follows it rather than being stranded.
+	if err := store.reKeyChatRowPortalID(ctx, "chat-1", from, to, true); err != nil {
+		t.Fatalf("reKeyChatRowPortalID(carryOrphans): %v", err)
+	}
+	if got := portalOf("orphan"); got != to {
+		t.Errorf("orphan row at %q with carryOrphans=true, want %q", got, to)
+	}
 }
