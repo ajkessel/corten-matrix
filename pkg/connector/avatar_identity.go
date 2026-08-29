@@ -15,14 +15,29 @@ import (
 	_ "image/jpeg"
 	_ "image/png"
 	"sync"
+	"sync/atomic"
 )
 
 // avatarContentHashCache memoizes decoded-pixel hashes keyed by the raw bytes'
 // hash, so each distinct photo is decoded at most once per process. The address
 // book is re-read every 15 minutes and every ghost is reconciled from it, so
 // without this the same few hundred photos would be decoded on every cycle.
-// Bounded by the number of distinct avatars the bridge has seen.
-var avatarContentHashCache sync.Map // string (byte hash) -> string (content hash)
+//
+// Keyed on the BYTE hash, which is exactly what churns in the bug this file
+// exists for: a server that re-encodes the same photo mints a new key on every
+// fetch, so "one entry per distinct avatar" is not a bound. Entries are counted
+// and the whole map is dropped past avatarContentHashCacheMax — a cold rebuild
+// costs one decode per photo on the next cycle, which is what the memo saves in
+// the first place, so the failure mode of the cap is mild.
+var (
+	avatarContentHashCache sync.Map // string (byte hash) -> string (content hash)
+	avatarContentHashCount atomic.Int64
+)
+
+// avatarContentHashCacheMax caps the memo. A large address book holds a few
+// hundred photos, so this is roughly an order of magnitude of headroom before
+// a re-encoding server can grow it without bound.
+const avatarContentHashCacheMax = 4096
 
 // avatarContentHash returns a hex identity for an avatar that is derived from
 // the image's DECODED PIXELS rather than its file bytes.
@@ -36,6 +51,13 @@ var avatarContentHashCache sync.Map // string (byte hash) -> string (content has
 // JPEGs of the same contact photo 15 minutes apart, and every ghost for that
 // contact churned. Pixel content is what users actually see, so keying identity
 // on it means a cosmetic re-encode is correctly a no-op.
+//
+// Re-keying every avatar_id on upgrade is silent for photos whose bytes are
+// unchanged — bridgev2's Reupload returns the existing MXC when the byte hash
+// matches, so prepareAvatar reports mxcChanged=false and no Matrix write
+// happens. It is NOT silent for a photo the server happens to re-encode on the
+// first post-upgrade fetch: that is a genuine byte change, so it uploads once
+// and then settles, which is the whole point of the pixel keying.
 //
 // Falls back to the raw-byte hash when the data isn't a decodable image (SVG,
 // a truncated download, an unknown format) — that keeps the previous behavior
@@ -54,7 +76,16 @@ func avatarContentHash(data []byte) string {
 	if img, _, err := image.Decode(bytes.NewReader(data)); err == nil {
 		result = pixelHash(img)
 	}
-	avatarContentHashCache.Store(byteKey, result)
+	if avatarContentHashCount.Load() >= avatarContentHashCacheMax {
+		avatarContentHashCache.Range(func(k, _ any) bool {
+			avatarContentHashCache.Delete(k)
+			return true
+		})
+		avatarContentHashCount.Store(0)
+	}
+	if _, loaded := avatarContentHashCache.LoadOrStore(byteKey, result); !loaded {
+		avatarContentHashCount.Add(1)
+	}
 	return result
 }
 

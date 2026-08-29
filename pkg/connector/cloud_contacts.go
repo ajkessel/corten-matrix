@@ -57,6 +57,11 @@ type contactSource interface {
 // is gated on a fetch failure, because a user who genuinely deletes most of
 // their address book must still be able to.
 //
+// Note the coupling this creates: a rejected sync is an error, so the caller
+// also skips setContactsReady and the refresh passes that ride it. For the one
+// case where an empty book is real — a user who deleted every contact — the
+// cache is in-memory, so the next restart starts from cached==0 and accepts it.
+//
 // fetchErr is the first per-address-book failure of this pass, or nil. It is
 // wrapped into the returned error so the caller's errors.Is checks still work —
 // errICloudContactsThrottled in particular, which drives the hard backoff.

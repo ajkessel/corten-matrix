@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"image"
 	"image/color"
 	"image/jpeg"
@@ -135,5 +136,35 @@ func TestAvatarContentHashUndecodable(t *testing.T) {
 	}
 	if avatarContentHash(nil) != "" {
 		t.Error("empty avatar must have empty identity")
+	}
+}
+
+// TestAvatarContentHashCacheIsBounded: the memo is keyed on the RAW BYTE hash,
+// which is exactly what churns in the bug this file addresses — a server that
+// re-encodes the same photo mints a new key on every fetch. Without a cap the
+// map grows for the life of the process.
+func TestAvatarContentHashCacheIsBounded(t *testing.T) {
+	avatarContentHashCache.Range(func(k, _ any) bool {
+		avatarContentHashCache.Delete(k)
+		return true
+	})
+	avatarContentHashCount.Store(0)
+
+	// Feed distinct undecodable blobs: each is a fresh byte key, standing in for
+	// a fresh re-encode of one contact photo.
+	for i := 0; i < avatarContentHashCacheMax+50; i++ {
+		avatarContentHash([]byte(fmt.Sprintf("not-an-image-%d", i)))
+	}
+
+	entries := 0
+	avatarContentHashCache.Range(func(_, _ any) bool {
+		entries++
+		return true
+	})
+	if entries > avatarContentHashCacheMax {
+		t.Errorf("memo holds %d entries, want at most %d", entries, avatarContentHashCacheMax)
+	}
+	if entries == 0 {
+		t.Error("memo emptied itself entirely — the cap should drop and refill, not disable caching")
 	}
 }

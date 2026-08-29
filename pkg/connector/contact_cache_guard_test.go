@@ -425,3 +425,32 @@ func TestGetUserInfoNamesUnnamedGhostFromSharedProfileWhileDegraded(t *testing.T
 		t.Fatalf("GetUserInfo() = %#v, want the shared-profile name for a nameless ghost", info)
 	}
 }
+
+// TestContactsDegradedIsTimeBounded: the hold-back exists to bridge the gap
+// while a contact source that is coming up hasn't answered yet. Left unbounded
+// it becomes a permanent regression on an install whose CardDAV never syncs —
+// every self-chat and group title stays unresolved for the life of the process.
+func TestContactsDegradedIsTimeBounded(t *testing.T) {
+	c := testNameClient(&fakeContactSource{contacts: map[string]*imessage.Contact{}})
+
+	if !c.contactsDegraded() {
+		t.Fatal("a freshly installed source that hasn't synced must count as degraded")
+	}
+
+	c.contactsMu.Lock()
+	c.contactsInstalledAt = time.Now().Add(-contactsDegradedGrace - time.Minute)
+	c.contactsMu.Unlock()
+	if c.contactsDegraded() {
+		t.Error("a source that never synced past the grace period must stop holding names back")
+	}
+
+	// A source that did sync is never degraded, however long ago it was
+	// installed.
+	healthy := testNameClient(&fakeContactSource{count: 2474, lastSync: time.Now()})
+	healthy.contactsMu.Lock()
+	healthy.contactsInstalledAt = time.Now().Add(-24 * time.Hour)
+	healthy.contactsMu.Unlock()
+	if healthy.contactsDegraded() {
+		t.Error("a synced source must never be degraded")
+	}
+}

@@ -219,8 +219,9 @@ type IMClient struct {
 	// Contact source for name resolution (iCloud or external CardDAV).
 	// Reassigned by retryCloudContacts while message handling reads it, so all
 	// access goes through contactStore()/setContactStore().
-	contacts   contactSource
-	contactsMu sync.RWMutex
+	contacts            contactSource
+	contactsInstalledAt time.Time
+	contactsMu          sync.RWMutex
 
 	// sharedProfiles is the in-memory cache of shared iMessage profile records
 	// (Name & Photo Sharing) received via ShareProfile / UpdateProfile
@@ -2460,6 +2461,13 @@ func (c *IMClient) dmFocusName(ctx context.Context, portal *bridgev2.Portal) *st
 	}
 	if c.isMyHandle(string(portal.ID)) {
 		base := c.dmBaseName(ctx, portal)
+		if base == "" {
+			// Same guard as the PrivateChatPortalMeta branch below: with the
+			// address book cold, resolveContactDisplayname answers "" for a
+			// self-chat, and stamping that would seize NameIsCustom on an empty
+			// title — the "lost contact name" shape. Leave the name as-is.
+			return nil
+		}
 		return &base
 	}
 	// Releasing the moon (peer available again): the title must return to the
@@ -10456,6 +10464,7 @@ func (c *IMClient) contactStore() contactSource {
 func (c *IMClient) setContactStore(store contactSource) {
 	c.contactsMu.Lock()
 	c.contacts = store
+	c.contactsInstalledAt = time.Now()
 	c.contactsMu.Unlock()
 }
 
@@ -10480,8 +10489,30 @@ func (c *IMClient) contactsDegraded() bool {
 	if store == nil {
 		return false
 	}
-	_, lastSync := store.CacheStatus()
-	return lastSync.IsZero()
+	if _, lastSync := store.CacheStatus(); !lastSync.IsZero() {
+		return false
+	}
+	// Never synced. Hold back only for a bounded window: the point is to bridge
+	// the gap while a source that is coming up hasn't answered yet, not to mask
+	// an address book that is permanently broken. Past the grace period, an
+	// install whose CardDAV never comes up would otherwise keep every self-chat
+	// and group title unresolved for the life of the process — a worse outcome
+	// than the raw-handle fallback, and one the user cannot see the cause of.
+	installedAt := c.contactStoreInstalledAt()
+	return installedAt.IsZero() || time.Since(installedAt) < contactsDegradedGrace
+}
+
+// contactsDegradedGrace is how long name resolution holds back after a contact
+// source is installed but before its first successful sync. Two failed
+// 15-minute cycles plus backoff fit inside it; a source that hasn't answered by
+// then is treated as absent rather than as briefly unavailable.
+const contactsDegradedGrace = 30 * time.Minute
+
+// contactStoreInstalledAt reports when the current contact source was installed.
+func (c *IMClient) contactStoreInstalledAt() time.Time {
+	c.contactsMu.RLock()
+	defer c.contactsMu.RUnlock()
+	return c.contactsInstalledAt
 }
 
 // retryCloudContacts retries the cloud contacts initialization periodically
