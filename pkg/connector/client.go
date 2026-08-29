@@ -1480,16 +1480,12 @@ func (c *IMClient) Connect(ctx context.Context) {
 	// Ensure shared-profile schema and hydrate the in-memory cache from the
 	// DB. Runs on every bridge start so existing installs pick up the table
 	// without needing a fresh login or reconfiguration.
+	sharedProfilesReady := false
 	if err := c.ensureSharedProfileSchema(context.Background()); err != nil {
 		log.Warn().Err(err).Msg("Failed to ensure shared_profiles schema")
 	} else {
 		c.loadSharedProfilesIntoCache(context.Background(), log)
-		// Independent of CardDAV: push cached state to ghosts immediately
-		// and re-fetch each row from CloudKit. Decoupled from
-		// setContactsReady so a slow MobileMe-delegate retry doesn't gate
-		// the share-profile path (it only depends on ProfilesClient /
-		// keychain init, not on contacts).
-		go c.refreshSharedProfilesOnConnect(log)
+		sharedProfilesReady = true
 	}
 
 	// Ensure Layer-2 MMCS attachment retry schema and spawn the background
@@ -1585,6 +1581,19 @@ func (c *IMClient) Connect(ctx context.Context) {
 			log.Warn().Msg("Cloud contacts unavailable on startup, will retry periodically")
 			go c.retryCloudContacts(log)
 		}
+	}
+
+	// Push cached shared profiles to ghosts and re-fetch them from CloudKit.
+	// Deliberately started AFTER the contact source is installed above, even
+	// though it doesn't need contacts itself: GetUserInfo only holds back a
+	// lower-priority source while a contact source EXISTS but hasn't synced
+	// (contactsDegraded), so a shared profile applied before installation
+	// slipped through and was overwritten by the address book two seconds
+	// later — one avatar upload and one displayname write per affected ghost,
+	// every startup. It stays decoupled from setContactsReady, so a slow
+	// MobileMe-delegate retry still doesn't gate the share-profile path.
+	if sharedProfilesReady {
+		go c.refreshSharedProfilesOnConnect(log)
 	}
 
 	if c.Main.Config.UseChatDBBackfill() {
