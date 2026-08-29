@@ -189,3 +189,58 @@ func TestOwnGhostIDs(t *testing.T) {
 		}
 	}
 }
+
+// TestMergeSelfGhostRooms pins the union of the two signals. Neither alone is
+// enough: authored-messages covers ghosts that must be joined (backfill will
+// re-join them to write history) but misses ones already joined without having
+// written — the case that still got evicted from two shortcode DMs — and
+// /joined_rooms is the reverse.
+func TestMergeSelfGhostRooms(t *testing.T) {
+	tel := makeUserID("tel:+15551234567")
+	mail := makeUserID("mailto:me@example.com")
+
+	authored := map[string]map[networkid.UserID]bool{
+		"mailto:me@example.com": {tel: true, mail: true},
+		"tel:+15559999999":      {tel: true},
+	}
+	joined := map[string]map[networkid.UserID]bool{
+		// Same portal, ghost already known: no change.
+		"tel:+15559999999": {tel: true},
+		// Joined but silent — the gap this signal closes.
+		"tel:+18886163241": {tel: true},
+		// Another own handle joined to a portal we already track.
+		"mailto:me@example.com": {mail: true},
+	}
+
+	got := mergeSelfGhostRooms(authored, joined)
+	if len(got) != 3 {
+		t.Fatalf("merged portals = %d, want 3: %#v", len(got), got)
+	}
+	if !got["tel:+18886163241"][tel] {
+		t.Error("joined-but-silent portal missing from the union — the ghost would be evicted again")
+	}
+	if !got["mailto:me@example.com"][tel] || !got["mailto:me@example.com"][mail] {
+		t.Errorf("union lost a ghost for a portal both signals mention: %#v", got["mailto:me@example.com"])
+	}
+	if len(got["tel:+15559999999"]) != 1 {
+		t.Errorf("overlapping entry duplicated: %#v", got["tel:+15559999999"])
+	}
+}
+
+// TestMergeSelfGhostRoomsEmptySides: a failed /joined_rooms call (or a bridge
+// with no history yet) must degrade to the other signal, not panic or wipe.
+func TestMergeSelfGhostRoomsEmptySides(t *testing.T) {
+	tel := makeUserID("tel:+15551234567")
+	authored := map[string]map[networkid.UserID]bool{"tel:+15559999999": {tel: true}}
+
+	if got := mergeSelfGhostRooms(authored, nil); len(got) != 1 || !got["tel:+15559999999"][tel] {
+		t.Errorf("merge with no joined-rooms data = %#v, want the authored set unchanged", got)
+	}
+	joined := map[string]map[networkid.UserID]bool{"tel:+18886163241": {tel: true}}
+	if got := mergeSelfGhostRooms(nil, joined); len(got) != 1 || !got["tel:+18886163241"][tel] {
+		t.Errorf("merge into a nil authored set = %#v, want the joined set", got)
+	}
+	if got := mergeSelfGhostRooms(nil, nil); len(got) != 0 {
+		t.Errorf("merge of two empty sets = %#v, want empty", got)
+	}
+}

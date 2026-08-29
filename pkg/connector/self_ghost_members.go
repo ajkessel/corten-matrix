@@ -10,8 +10,10 @@ import (
 	"strings"
 
 	"maunium.net/go/mautrix/bridgev2"
+	matrixfmt "maunium.net/go/mautrix/bridgev2/matrix"
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/event"
+	"maunium.net/go/mautrix/id"
 )
 
 // selfGhostMemberKeySuffix distinguishes the plain-ghost member entry for one of
@@ -39,10 +41,19 @@ const selfGhostMemberKeySuffix = "\x00self-ghost"
 // and avatar, in their self-chats and in every DM/group where they had sent
 // messages before double puppeting was configured — on every single startup.
 //
-// Loaded with one query per connect rather than per portal: GetChatInfo runs for
-// every portal on a startup resync (thousands), and the answer only changes when
-// an own-handle ghost writes in a NEW room — which, being a live send, joins the
-// ghost anyway, and is picked up by the next load.
+// Two signals are unioned, because either alone leaves rooms exposed:
+//   - ghosts that AUTHORED messages in the portal (one DB query). This is the
+//     set that must never be evicted: forward backfill re-joins such a ghost to
+//     write history, so a kick just starts a leave/rejoin cycle.
+//   - ghosts CURRENTLY JOINED to the portal's room (one /joined_rooms per own
+//     handle). A ghost can be joined without having authored anything — seen in
+//     the wild on two shortcode DMs, where the message-only signal missed it and
+//     the member sync evicted it.
+//
+// Loaded once per connect rather than per portal: GetChatInfo runs for every
+// portal on a startup resync (thousands), and the answer only changes when an
+// own-handle ghost writes in or joins a NEW room — either way a live action that
+// joins the ghost anyway, and is picked up by the next load.
 func (c *IMClient) selfGhostRooms(ctx context.Context) map[string]map[networkid.UserID]bool {
 	c.selfGhostRoomsMu.Lock()
 	defer c.selfGhostRoomsMu.Unlock()
@@ -90,10 +101,106 @@ func (c *IMClient) selfGhostRooms(ctx context.Context) map[string]map[networkid.
 		return nil
 	}
 
+	authored := len(result)
+	result = mergeSelfGhostRooms(result, c.selfGhostJoinedRooms(ctx, ownGhostIDs))
+
 	c.selfGhostRoomsCache = result
 	c.selfGhostRoomsLoaded = true
-	c.UserLogin.Log.Debug().Int("portals", len(result)).
-		Msg("Loaded portals where a ghost for one of our own handles authored messages")
+	c.UserLogin.Log.Debug().
+		Int("portals", len(result)).
+		Int("from_authored_messages", authored).
+		Msg("Loaded portals whose member list must keep a ghost for one of our own handles")
+	return result
+}
+
+// mergeSelfGhostRooms folds src into dst, unioning the ghost sets per portal, and
+// returns the result. Either side may be nil: the authored-messages query and the
+// /joined_rooms enumeration each cover rooms the other misses, and either can
+// come back empty (no history yet, or a homeserver call that failed).
+func mergeSelfGhostRooms(dst, src map[string]map[networkid.UserID]bool) map[string]map[networkid.UserID]bool {
+	if len(src) == 0 {
+		return dst
+	}
+	if dst == nil {
+		dst = make(map[string]map[networkid.UserID]bool, len(src))
+	}
+	for portalID, ghosts := range src {
+		if dst[portalID] == nil {
+			dst[portalID] = make(map[networkid.UserID]bool, len(ghosts))
+		}
+		for ghostID := range ghosts {
+			dst[portalID][ghostID] = true
+		}
+	}
+	return dst
+}
+
+// selfGhostJoinedRooms asks the homeserver which rooms each own-handle ghost is
+// actually joined to and maps them back to portal IDs. One /joined_rooms request
+// per own handle (a handful), masquerading as that ghost — not per portal.
+//
+// This is the precise form of the invariant: the member sync only evicts members
+// that are currently joined, so enumerating them is what makes the protection
+// complete. The authored-messages query stays as the primary signal because it
+// also covers a ghost that SHOULD be joined but currently isn't (backfill will
+// join it to write history), which /joined_rooms by definition cannot report.
+//
+// A failure for one handle is logged and skipped rather than retried per portal:
+// the union degrades to the authored-messages signal for that handle, and the
+// next connect re-enumerates.
+func (c *IMClient) selfGhostJoinedRooms(ctx context.Context, ownGhostIDs []networkid.UserID) map[string]map[networkid.UserID]bool {
+	portals, err := c.Main.Bridge.GetAllPortalsWithMXID(ctx)
+	if err != nil {
+		c.UserLogin.Log.Warn().Err(err).Msg("Failed to load portals to map own-handle ghost rooms")
+		return nil
+	}
+	byMXID := make(map[id.RoomID]string, len(portals))
+	for _, portal := range portals {
+		if portal.Receiver == c.UserLogin.ID && portal.MXID != "" {
+			byMXID[portal.MXID] = string(portal.ID)
+		}
+	}
+	if len(byMXID) == 0 {
+		return nil
+	}
+
+	result := make(map[string]map[networkid.UserID]bool)
+	for _, ghostID := range ownGhostIDs {
+		ghost, err := c.Main.Bridge.GetGhostByID(ctx, ghostID)
+		if err != nil || ghost == nil {
+			c.UserLogin.Log.Warn().Err(err).Str("ghost_id", string(ghostID)).
+				Msg("Failed to load own-handle ghost to enumerate its rooms")
+			continue
+		}
+		asIntent, ok := ghost.Intent.(*matrixfmt.ASIntent)
+		if !ok {
+			// Not the appservice connector (or a test double) — the
+			// authored-messages signal carries the protection alone.
+			return result
+		}
+		resp, err := asIntent.Matrix.JoinedRooms(ctx)
+		if err != nil {
+			c.UserLogin.Log.Warn().Err(err).Str("ghost_id", string(ghostID)).
+				Msg("Failed to list rooms joined by an own-handle ghost")
+			continue
+		}
+		joined := 0
+		for _, roomID := range resp.JoinedRooms {
+			portalID, ok := byMXID[roomID]
+			if !ok {
+				continue
+			}
+			if result[portalID] == nil {
+				result[portalID] = make(map[networkid.UserID]bool, 1)
+			}
+			result[portalID][ghostID] = true
+			joined++
+		}
+		c.UserLogin.Log.Debug().Str("ghost_id", string(ghostID)).
+			Int("joined_portals", joined).
+			Int("joined_rooms_total", len(resp.JoinedRooms)).
+			Msg("Enumerated rooms joined by an own-handle ghost")
+	}
 	return result
 }
 
