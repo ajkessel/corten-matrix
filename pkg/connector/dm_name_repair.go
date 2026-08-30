@@ -7,9 +7,12 @@ package connector
 
 import (
 	"context"
+	"errors"
+	"net/http"
 	"time"
 
 	"github.com/rs/zerolog"
+	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
@@ -72,9 +75,6 @@ func (c *IMClient) repairDivergedDMRoomNames(log zerolog.Logger) {
 	// permanently failing room — the bot lacking the power level for
 	// m.room.name, say — would never write the flag and would re-sweep every
 	// tick forever. One attempt per process; a genuine retry costs a restart.
-	if c.dmNameRepairRan.Swap(true) {
-		return
-	}
 	stateReader, ok := c.Main.Bridge.Matrix.(bridgev2.MatrixConnectorWithArbitraryRoomState)
 	if !ok {
 		log.Debug().Msg("Matrix connector can't read arbitrary room state — skipping DM name repair")
@@ -87,7 +87,14 @@ func (c *IMClient) repairDivergedDMRoomNames(log zerolog.Logger) {
 		return
 	}
 
-	var checked, repaired, failed int
+	// Claim the single per-process attempt only once the sweep can actually
+	// start. Placed above the two exits before it, a failure to even load the
+	// portal list would have burned the attempt for the whole process.
+	if c.dmNameRepairRan.Swap(true) {
+		return
+	}
+
+	var checked, repaired, failed, transient int
 	budgetLeft := dmNameRepairBudget
 	for _, portal := range portals {
 		if budgetLeft <= 0 {
@@ -132,16 +139,21 @@ func (c *IMClient) repairDivergedDMRoomNames(log zerolog.Logger) {
 		// Mirror sendRoomMeta's own output: the implicit flag (the name is
 		// derived, not custom) and no timeline entry, so a correction doesn't
 		// read as someone renaming the room.
-		_, err = c.Main.Bridge.Bot.SendState(ctx, portal.MXID, event.StateRoomName, "", &event.Content{
+		var pushErr error
+		_, pushErr = c.Main.Bridge.Bot.SendState(ctx, portal.MXID, event.StateRoomName, "", &event.Content{
 			Parsed: &event.RoomNameEventContent{Name: want},
 			Raw: map[string]any{
 				"fi.mau.implicit_name":             true,
 				"com.beeper.exclude_from_timeline": true,
 			},
 		}, time.Time{})
-		if err != nil {
+		if pushErr != nil {
 			failed++
-			log.Warn().Err(err).Str("portal_mxid", string(portal.MXID)).
+			if !dmNameRepairFailurePermanent(pushErr) {
+				transient++
+			}
+			log.Warn().Err(pushErr).Str("portal_mxid", string(portal.MXID)).
+				Bool("permanent", dmNameRepairFailurePermanent(pushErr)).
 				Msg("Failed to re-push diverged DM room name")
 			continue
 		}
@@ -171,17 +183,59 @@ func (c *IMClient) repairDivergedDMRoomNames(log zerolog.Logger) {
 			Msg("DM name repair finished with failures — will retry on next startup")
 		return
 	}
+	if failed > 0 && transient > 0 {
+		// Nothing repaired, but at least one failure could clear on its own — a
+		// 5xx or a network error, e.g. a homeserver restart spanning the sweep.
+		// Retiring the repair on that would strand the damage permanently, so
+		// leave the flag for the next startup.
+		log.Info().Int("checked", checked).Int("failed", failed).Int("transient", transient).
+			Msg("DM name repair failed transiently — will retry on next startup")
+		return
+	}
 	if failed > 0 {
-		// Repaired nothing and still failed: the failures are structural (the
-		// bot lacking the power level for m.room.name, or no longer being in
-		// the room), so a retry would fail identically. Write the flag and stop
-		// sweeping thousands of rooms on every restart forever.
+		// Repaired nothing and every failure is structural (the bot lacking the
+		// power level for m.room.name, or no longer being in the room), so a
+		// retry would fail identically. Write the flag and stop sweeping
+		// thousands of rooms on every restart forever.
 		log.Warn().Int("checked", checked).Int("failed", failed).
 			Msg("DM name repair could not repair any room — recording it as done rather than retrying")
 	}
 	c.Main.Bridge.DB.KV.Set(ctx, dmNameRepairKey, time.Now().Format(time.RFC3339))
 	log.Info().Int("checked", checked).Int("repaired", repaired).
 		Msg("DM name repair complete")
+}
+
+// dmNameRepairFailurePermanent reports whether a failed name push will fail the
+// same way on the next attempt.
+//
+// M_FORBIDDEN is the structural case this sweep actually hits: the bridge bot
+// lacks the power level for m.room.name, or is no longer in the room. Those
+// don't heal, so a pass consisting only of them should record itself as done.
+// A 5xx, a timeout or a transport error is the opposite — a homeserver restart
+// spanning the sweep produces the identical "nothing repaired" signature, and
+// retiring the repair on that would strand the damage for good.
+func dmNameRepairFailurePermanent(err error) bool {
+	var httpErr mautrix.HTTPError
+	if !errors.As(err, &httpErr) {
+		return false
+	}
+	if httpErr.RespError != nil {
+		switch httpErr.RespError.ErrCode {
+		case mautrix.MForbidden.ErrCode, mautrix.MNotFound.ErrCode, mautrix.MUnrecognized.ErrCode:
+			return true
+		case mautrix.MLimitExceeded.ErrCode:
+			return false
+		}
+	}
+	if httpErr.Response == nil {
+		return false
+	}
+	// Any other 4xx is a request we will keep getting wrong — except 429, which
+	// is the homeserver asking us to come back later.
+	if httpErr.Response.StatusCode == http.StatusTooManyRequests {
+		return false
+	}
+	return httpErr.Response.StatusCode >= 400 && httpErr.Response.StatusCode < 500
 }
 
 // dmNameRepairEnabled reports whether the sweep should run at all.
