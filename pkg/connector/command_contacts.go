@@ -87,7 +87,8 @@ func fnContacts(ce *commands.Event) {
 		ce.Reply("Bridge client not available.")
 		return
 	}
-	if client.contacts == nil {
+	store := client.contactStore()
+	if store == nil {
 		ce.Reply("Contacts have not synced yet. Try again in a moment.")
 		return
 	}
@@ -95,7 +96,7 @@ func fnContacts(ce *commands.Event) {
 	query := strings.ToLower(strings.Join(ce.Args, " "))
 
 	// --- Phase 1: name search across all loaded contacts ---
-	all := client.contacts.GetAllContacts()
+	all := store.GetAllContacts()
 
 	type candidate struct {
 		identifier string // tel:+ or mailto: form used for validation / portal key

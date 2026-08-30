@@ -32,6 +32,58 @@ type contactSource interface {
 	GetContactInfo(identifier string) (*imessage.Contact, error)
 	// GetAllContacts returns a snapshot of all cached contacts for bulk search.
 	GetAllContacts() []*imessage.Contact
+	// CacheStatus reports how many contacts are cached and when the cache was
+	// last populated by a sync that passed the replace guard (zero time if no
+	// sync has ever populated it). Callers use the zero time to tell "the
+	// address book hasn't loaded yet" apart from "the address book is empty",
+	// so a name that was already resolved is never downgraded to a raw handle
+	// just because contacts are temporarily unavailable.
+	CacheStatus() (contacts int, lastSync time.Time)
+}
+
+// checkContactCacheReplace decides whether a completed CardDAV fetch may
+// replace the live contact cache. A transient server error (Google's CardDAV
+// endpoint answers REPORT with HTTP 500 often enough to matter) used to be
+// non-fatal: the fetch loop skipped the failed address book, the swap ran
+// anyway, and SyncContacts returned success with an EMPTY cache. Everything
+// downstream then read "this handle has no contact" and rewrote ghost display
+// names from the raw identifier, which fans a member event into every shared
+// room — then the next good sync flipped them all back. Refuse the swap
+// instead, and return an error so the periodic loop backs off and skips the
+// readiness/refresh passes that would run against a bad cache.
+//
+// The empty case is rejected unconditionally: a server that reports zero
+// contacts when we hold thousands is never telling the truth. The shrink case
+// is gated on a fetch failure, because a user who genuinely deletes most of
+// their address book must still be able to.
+//
+// Note the coupling this creates: a rejected sync is an error, so the caller
+// also skips setContactsReady and the refresh passes that ride it. For the one
+// case where an empty book is real — a user who deleted every contact — the
+// cache is in-memory, so the next restart starts from cached==0 and accepts it.
+//
+// fetchErr is the first per-address-book failure of this pass, or nil. It is
+// wrapped into the returned error so the caller's errors.Is checks still work —
+// errICloudContactsThrottled in particular, which drives the hard backoff.
+func checkContactCacheReplace(cached, fetched, addressBooks int, fetchErr error) error {
+	if cached == 0 {
+		return nil
+	}
+	var reason string
+	switch {
+	case fetched == 0:
+		reason = fmt.Sprintf("refusing to replace %d cached contacts with an empty fetch (%d address books)",
+			cached, addressBooks)
+	case fetchErr != nil && fetched < cached/2:
+		reason = fmt.Sprintf("refusing to replace %d cached contacts with a partial fetch of %d (%d address books)",
+			cached, fetched, addressBooks)
+	default:
+		return nil
+	}
+	if fetchErr != nil {
+		return fmt.Errorf("%s: %w", reason, fetchErr)
+	}
+	return errors.New(reason)
 }
 
 // cloudContactsClient fetches contacts from iCloud via CardDAV and caches
@@ -156,13 +208,27 @@ func (c *cloudContactsClient) SyncContacts(log zerolog.Logger) error {
 
 	// Step 4: Fetch all vCards from each address book
 	var allContacts []*imessage.Contact
+	var firstFetchErr error
 	for _, abURL := range addressBooks {
 		contacts, fetchErr := c.fetchAllVCards(log, abURL)
 		if fetchErr != nil {
+			if firstFetchErr == nil {
+				firstFetchErr = sanitizeURLError(fetchErr, abURL)
+			}
 			log.Warn().Err(sanitizeURLError(fetchErr, abURL)).Str("address_book_host", logSafeURL(abURL)).Msg("CardDAV: failed to fetch vCards")
 			continue
 		}
 		allContacts = append(allContacts, contacts...)
+	}
+
+	// Step 4.4: Bail out before touching the live cache if this fetch is not
+	// plausibly the whole address book. See checkContactCacheReplace: a
+	// transient 500 must never be allowed to blank the cache, because that
+	// silently downgrades every resolved contact name to a raw handle.
+	cached, _ := c.CacheStatus()
+	if err := checkContactCacheReplace(cached, len(allContacts), len(addressBooks), firstFetchErr); err != nil {
+		log.Warn().Err(err).Msg("CardDAV: keeping previous contact cache")
+		return err
 	}
 
 	// Step 4.5: Carry over avatars already downloaded in a previous sync, then
@@ -274,6 +340,16 @@ func (c *cloudContactsClient) GetContactInfo(identifier string) (*imessage.Conta
 	}
 
 	return nil, nil
+}
+
+// CacheStatus implements contactSource.
+func (c *cloudContactsClient) CacheStatus() (int, time.Time) {
+	if c == nil {
+		return 0, time.Time{}
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return len(c.contacts), c.lastSync
 }
 
 // GetAllContacts returns a snapshot of the full contact list for bulk search.

@@ -1573,7 +1573,8 @@ func (c *IMClient) inviteSingleHandleToStatusSharing(log zerolog.Logger, handle 
 }
 
 func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
-	if c.contacts == nil {
+	store := c.contactStore()
+	if store == nil {
 		return
 	}
 	ctx := context.Background()
@@ -1615,7 +1616,7 @@ func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
 		if localID == "" {
 			continue
 		}
-		contact, _ := c.contacts.GetContactInfo(localID)
+		contact, _ := store.GetContactInfo(localID)
 		if contact == nil || !contact.HasName() {
 			// No address-book name for this ghost. Normally skip for efficiency
 			// — don't load every group participant's ghost just to confirm it
@@ -1670,7 +1671,7 @@ func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
 // numbers / email addresses as the room name. This also picks up contact
 // edits on subsequent periodic syncs.
 func (c *IMClient) refreshGroupPortalNamesFromContacts(log zerolog.Logger) {
-	if c.contacts == nil {
+	if c.contactStore() == nil {
 		return
 	}
 	ctx := context.Background()

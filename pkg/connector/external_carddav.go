@@ -116,13 +116,29 @@ func (c *externalCardDAVClient) SyncContacts(log zerolog.Logger) error {
 
 	// Step 4: Fetch all vCards
 	var allContacts []*imessage.Contact
+	var firstFetchErr error
 	for _, abURL := range addressBooks {
 		contacts, fetchErr := c.fetchAllVCards(log, abURL)
 		if fetchErr != nil {
+			if firstFetchErr == nil {
+				firstFetchErr = sanitizeURLError(fetchErr, abURL)
+			}
 			log.Warn().Err(sanitizeURLError(fetchErr, abURL)).Str("address_book_host", logSafeURL(abURL)).Msg("External CardDAV: failed to fetch vCards")
 			continue
 		}
 		allContacts = append(allContacts, contacts...)
+	}
+
+	// Step 4.4: Refuse to replace a good cache with an empty or implausibly
+	// small one. Google's CardDAV endpoint answers REPORT with HTTP 500 often
+	// enough that this fired in practice: the address book was wiped for one
+	// 15-minute cycle, every ghost display name fell back to the raw handle,
+	// and the next good sync flipped them all back. See
+	// checkContactCacheReplace.
+	cached, _ := c.CacheStatus()
+	if err := checkContactCacheReplace(cached, len(allContacts), len(addressBooks), firstFetchErr); err != nil {
+		log.Warn().Err(err).Msg("External CardDAV: keeping previous contact cache")
+		return err
 	}
 
 	// Step 4.5: Download any photo URLs (e.g. Google uses URL-based PHOTO fields)
@@ -177,6 +193,16 @@ func (c *externalCardDAVClient) GetContactInfo(identifier string) (*imessage.Con
 	}
 
 	return nil, nil
+}
+
+// CacheStatus implements contactSource.
+func (c *externalCardDAVClient) CacheStatus() (int, time.Time) {
+	if c == nil {
+		return 0, time.Time{}
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return len(c.contacts), c.lastSync
 }
 
 // GetAllContacts returns a snapshot of the full contact list for bulk search.
