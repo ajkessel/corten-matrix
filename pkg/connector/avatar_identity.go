@@ -29,6 +29,13 @@ import (
 // and the whole map is dropped past avatarContentHashCacheMax — a cold rebuild
 // costs one decode per photo on the next cycle, which is what the memo saves in
 // the first place, so the failure mode of the cap is mild.
+//
+// The count is deliberately not synchronized with the clear: two goroutines can
+// clear concurrently and one Store(0) can land after the other's Add(1), so the
+// count can drift low and the map briefly exceed the cap. This is a memo, not a
+// correctness structure — a wrong entry is impossible (keys are content
+// hashes), and the bound still holds in practice — so it isn't worth a mutex on
+// a path that runs per ghost per reconcile.
 var (
 	avatarContentHashCache sync.Map // string (byte hash) -> string (content hash)
 	avatarContentHashCount atomic.Int64

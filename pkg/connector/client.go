@@ -10464,7 +10464,23 @@ func (c *IMClient) contactStore() contactSource {
 func (c *IMClient) setContactStore(store contactSource) {
 	c.contactsMu.Lock()
 	c.contacts = store
-	c.contactsInstalledAt = time.Now()
+	// First install only. contactsDegraded times how long the source has had to
+	// come up, and retryCloudContacts re-installs the SAME failing source on
+	// every attempt — re-stamping here would re-arm the grace window on each
+	// one. With a 30m grace and a 2m..1h backoff that means the window never
+	// expires at all while the interval is under 30m, and then oscillates at
+	// the cap: degraded for 30m, healthy for 30m, forever. That is the
+	// flip-flop this file exists to stop, on an hourly period.
+	//
+	// What the window measures is when a source first appeared, which a retry
+	// of that same source does not change. Safe as first-install-wins because
+	// only one source type is ever installed per process (Connect picks exactly
+	// one of external CardDAV / local / cloud, and retryCloudContacts only
+	// re-installs the cloud client), and once any sync succeeds lastSync is
+	// non-zero so contactsDegraded returns before it consults this at all.
+	if c.contactsInstalledAt.IsZero() {
+		c.contactsInstalledAt = time.Now()
+	}
 	c.contactsMu.Unlock()
 }
 

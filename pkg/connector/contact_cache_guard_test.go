@@ -444,6 +444,15 @@ func TestContactsDegradedIsTimeBounded(t *testing.T) {
 		t.Error("a source that never synced past the grace period must stop holding names back")
 	}
 
+	// A retry of the same failing source must NOT re-arm the window.
+	// retryCloudContacts calls setContactStore on every attempt with a 2m..1h
+	// backoff, so re-stamping there kept the window from ever expiring while the
+	// interval was under the grace, then oscillated it at the cap.
+	c.setContactStore(&fakeContactSource{contacts: map[string]*imessage.Contact{}})
+	if c.contactsDegraded() {
+		t.Error("re-installing the same never-syncing source re-armed the grace window")
+	}
+
 	// A source that did sync is never degraded, however long ago it was
 	// installed.
 	healthy := testNameClient(&fakeContactSource{count: 2474, lastSync: time.Now()})
