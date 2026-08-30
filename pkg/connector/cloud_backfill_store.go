@@ -2330,6 +2330,7 @@ func (s *cloudBackfillStore) resetForwardBackfillDone(ctx context.Context, porta
 // groupChatRow is one group cloud_chat row
 // used by the participant-set consolidation migration.
 type groupChatRow struct {
+	cloudChatID  string
 	portalID     string
 	participants []string
 }
@@ -2340,11 +2341,23 @@ type groupChatRow struct {
 func (s *cloudBackfillStore) listGroupChats(ctx context.Context) ([]groupChatRow, error) {
 	// All group chats (not just carrier): iMessage group GUIDs also rotate over
 	// time, so any group can end up split across multiple gid:/comma portals.
+	// Every row, not one per portal_id, and in a deterministic order.
+	//
+	// This used to SELECT DISTINCT portal_id and keep only the first row seen
+	// per portal, with no ORDER BY. When two chats share a portal_id (the
+	// design intends one room per participant set, so distinct chats with the
+	// same roster DO share one) and their rosters have since diverged,
+	// whichever row Postgres happened to return first decided the room's
+	// canonical key — and re-keying rewrote the row, changing its heap
+	// position, so the OTHER row won next startup. That is the group-membership
+	// flip-flop: the room was re-ID'd back and forth between two rosters on
+	// every restart, kicking and re-inviting the difference each time.
 	rows, err := s.db.Query(ctx,
-		`SELECT DISTINCT portal_id, participants_json FROM cloud_chat
+		`SELECT cloud_chat_id, portal_id, participants_json FROM cloud_chat
 		 WHERE login_id=$1 AND deleted=FALSE
 		   AND portal_id <> '' AND participants_json IS NOT NULL AND participants_json <> ''
-		   AND (portal_id LIKE 'gid:%' OR portal_id LIKE '%,%')`,
+		   AND (portal_id LIKE 'gid:%' OR portal_id LIKE '%,%')
+		 ORDER BY portal_id, cloud_chat_id`,
 		s.loginID,
 	)
 	if err != nil {
@@ -2355,11 +2368,11 @@ func (s *cloudBackfillStore) listGroupChats(ctx context.Context) ([]groupChatRow
 	var out []groupChatRow
 	seen := make(map[string]bool)
 	for rows.Next() {
-		var portalID, participantsJSON string
-		if err = rows.Scan(&portalID, &participantsJSON); err != nil {
+		var cloudChatID, portalID, participantsJSON string
+		if err = rows.Scan(&cloudChatID, &portalID, &participantsJSON); err != nil {
 			return nil, err
 		}
-		if seen[portalID] {
+		if seen[cloudChatID] {
 			continue
 		}
 		var raw []string
@@ -2375,8 +2388,8 @@ func (s *cloudBackfillStore) listGroupChats(ctx context.Context) ([]groupChatRow
 		if len(normalized) == 0 {
 			continue
 		}
-		seen[portalID] = true
-		out = append(out, groupChatRow{portalID: portalID, participants: normalized})
+		seen[cloudChatID] = true
+		out = append(out, groupChatRow{cloudChatID: cloudChatID, portalID: portalID, participants: normalized})
 	}
 	return out, rows.Err()
 }
@@ -2397,7 +2410,7 @@ func (s *cloudBackfillStore) listGroupChats(ctx context.Context) ([]groupChatRow
 //
 // Rediscovering from the portal side survives the re-key: a gid: portal's UUID
 // is embedded in its own id (see resolveConversationID), and cloud_chat.group_id
-// is never rewritten by reKeyPortalID (only portal_id is), so joining on it
+// is never rewritten by the re-key (only portal_id is), so joining on it
 // finds the group's current canonical portal_id no matter how many times its
 // cloud rows have moved. Returns gid: portal_id -> canonical portal_id for every
 // such stale room; the caller merges these into the normal consolidation plan so
@@ -2445,26 +2458,48 @@ func (s *cloudBackfillStore) orphanedGroupRoomPortalIDs(ctx context.Context, bri
 	return out, rows.Err()
 }
 
-// reKeyPortalID re-points all cloud_chat and cloud_message rows from oldPortalID
-// to newPortalID and resets forward-backfill state so the re-keyed messages
-// re-backfill into the new portal's room. updated_ts is bumped so the portal
-// isn't skipped by the "fully backfilled, no new content" startup filter.
-// Mirrors the normalizeGroup*PortalIDs migrations. No-op-safe.
-func (s *cloudBackfillStore) reKeyPortalID(ctx context.Context, oldPortalID, newPortalID string) error {
-	if oldPortalID == "" || newPortalID == "" || oldPortalID == newPortalID {
+// reKeyChatRowPortalID re-keys ONE chat's rows to a new portal ID, matched by
+// cloud_chat_id rather than by the old portal ID.
+//
+// Matching on the old portal ID instead (as this used to) moves every row that
+// shares it, which is wrong when two chats do: the foreign chat was dragged onto
+// a key its own roster disagrees with, and then demanded its own key back on the
+// next startup — the group-membership flip-flop. Splitting by chat lets each
+// conversation settle on the key its roster actually implies.
+func (s *cloudBackfillStore) reKeyChatRowPortalID(ctx context.Context, cloudChatID, oldPortalID, newPortalID string, carryOrphans bool) error {
+	if cloudChatID == "" || newPortalID == "" || oldPortalID == newPortalID {
 		return nil
 	}
 	nowMS := time.Now().UnixMilli()
 	if _, err := s.db.Exec(ctx,
 		`UPDATE cloud_chat SET portal_id=$3, fwd_backfill_done=FALSE, updated_ts=$4
-		 WHERE login_id=$1 AND portal_id=$2`,
-		s.loginID, oldPortalID, newPortalID, nowMS,
+		 WHERE login_id=$1 AND cloud_chat_id=$2`,
+		s.loginID, cloudChatID, newPortalID, nowMS,
 	); err != nil {
 		return err
 	}
 	if _, err := s.db.Exec(ctx,
 		`UPDATE cloud_message SET portal_id=$3, updated_ts=$4
-		 WHERE login_id=$1 AND portal_id=$2`,
+		 WHERE login_id=$1 AND chat_id=$2`,
+		s.loginID, cloudChatID, newPortalID, nowMS,
+	); err != nil {
+		return err
+	}
+	if !carryOrphans || oldPortalID == "" {
+		return nil
+	}
+	// The realtime paths (persistMessageUUID, persistTapbackUUID) insert
+	// cloud_message rows with a portal_id and no chat_id, so chat-scoped
+	// matching alone strands them under the old key — where portal-scoped
+	// reads still count them: getOldestMessageTimestamp /
+	// getNewestMessageTimestamp bound the backfill window,
+	// portalHasPreStartupOutgoingMessages drives read-receipt re-delivery, and
+	// the portal purge would leave them behind. The caller only sets
+	// carryOrphans when every conversation under the old key moves to the same
+	// target, so these rows can only belong to this one.
+	if _, err := s.db.Exec(ctx,
+		`UPDATE cloud_message SET portal_id=$3, updated_ts=$4
+		 WHERE login_id=$1 AND portal_id=$2 AND (chat_id IS NULL OR chat_id='')`,
 		s.loginID, oldPortalID, newPortalID, nowMS,
 	); err != nil {
 		return err
