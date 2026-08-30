@@ -391,6 +391,9 @@ type IMClient struct {
 	selfGhostRoomsLoaded  bool
 	selfGhostRoomsRetryAt time.Time
 
+	// Guards the one-shot diverged-DM-name repair; see repairDivergedDMRoomNames.
+	dmNameRepairRan atomic.Bool
+
 	// Contacts readiness gate for CloudKit message sync.
 	contactsReady     bool
 	contactsReadyLock sync.RWMutex
