@@ -767,7 +767,7 @@ func TestReconcileGappedPortalsFlagsUndeliveredContent(t *testing.T) {
 // reads cloud_chat.portal_id) no longer sees it as needing a move — its Matrix
 // room is stuck at the old gid:<UUID> key forever. orphanedGroupRoomPortalIDs
 // must find that stale room by joining on cloud_chat.group_id, which
-// reKeyPortalID never rewrites (only portal_id is re-keyed) — and on
+// the re-key never rewrites (only portal_id is re-keyed) — and on
 // cloud_chat_id, since a legacy room's UUID may be the chat_id instead.
 func TestOrphanedGroupRoomPortalIDs(t *testing.T) {
 	ctx := context.Background()

@@ -2410,7 +2410,7 @@ func (s *cloudBackfillStore) listGroupChats(ctx context.Context) ([]groupChatRow
 //
 // Rediscovering from the portal side survives the re-key: a gid: portal's UUID
 // is embedded in its own id (see resolveConversationID), and cloud_chat.group_id
-// is never rewritten by reKeyPortalID (only portal_id is), so joining on it
+// is never rewritten by the re-key (only portal_id is), so joining on it
 // finds the group's current canonical portal_id no matter how many times its
 // cloud rows have moved. Returns gid: portal_id -> canonical portal_id for every
 // such stale room; the caller merges these into the normal consolidation plan so
@@ -2458,11 +2458,6 @@ func (s *cloudBackfillStore) orphanedGroupRoomPortalIDs(ctx context.Context, bri
 	return out, rows.Err()
 }
 
-// reKeyPortalID re-points all cloud_chat and cloud_message rows from oldPortalID
-// to newPortalID and resets forward-backfill state so the re-keyed messages
-// re-backfill into the new portal's room. updated_ts is bumped so the portal
-// isn't skipped by the "fully backfilled, no new content" startup filter.
-// Mirrors the normalizeGroup*PortalIDs migrations.
 // reKeyChatRowPortalID re-keys ONE chat's rows to a new portal ID, matched by
 // cloud_chat_id rather than by the old portal ID.
 //
