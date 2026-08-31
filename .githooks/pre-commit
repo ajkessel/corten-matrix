@@ -12,4 +12,58 @@ if [ -n "$blocked" ]; then
   echo "Unstage with:  git restore --staged <path>" >&2
   exit 1
 fi
+
+# ── gofmt, mirroring the "gofmt (changed files)" step in ci.yml ─────────────
+#
+# That step runs gofmt over WHOLE files a PR touches, and 14 files inherited
+# from upstream are not gofmt-clean (deliberately — reformatting them wholesale
+# would create conflict surface against future upstream rebases). The
+# consequence is easy to trip over: whether you pass the check depends on WHICH
+# file you edited, not on what you wrote. A two-line change to an inherited file
+# fails CI on pre-existing misformatting elsewhere in the same file, minutes
+# after you pushed. This says so before the commit instead.
+#
+# Bypass, like the guard above: git commit --no-verify
+
+# Staged Go files, excluding deletions — the same --diff-filter CI uses.
+files=$(git diff --cached --name-only --diff-filter=ACMR -- '*.go')
+[ -n "$files" ] || exit 0
+
+if ! command -v gofmt >/dev/null 2>&1; then
+  echo "pre-commit: gofmt is not on PATH; skipping the format check (CI still enforces it)" >&2
+  exit 0
+fi
+
+# Check the STAGED content rather than the working tree: that is what the commit
+# — and therefore CI — will actually see. Checking the tree would pass a commit
+# whose staged version is still unformatted, which is the case most worth
+# catching (`gofmt -w` run after `git add`).
+unformatted=""
+while IFS= read -r f; do
+  [ -n "$f" ] || continue
+  staged=$(git show ":$f")
+  if ! formatted=$(printf '%s\n' "$staged" | gofmt 2>/dev/null); then
+    echo "pre-commit: gofmt could not parse the staged $f (syntax error?)" >&2
+    exit 1
+  fi
+  [ "$staged" = "$formatted" ] || unformatted="$unformatted $f"
+done <<EOF
+$files
+EOF
+
+if [ -n "$unformatted" ]; then
+  echo "pre-commit: gofmt would reformat staged Go files:" >&2
+  for f in $unformatted; do
+    echo "   $f" >&2
+  done
+  echo "" >&2
+  echo "CI checks whole files, so pre-existing misformatting in a file you touched" >&2
+  echo "counts against you. Fix and re-stage:" >&2
+  echo "" >&2
+  echo "  gofmt -w$unformatted && git add$unformatted" >&2
+  echo "" >&2
+  echo "To commit anyway: git commit --no-verify" >&2
+  exit 1
+fi
+
 exit 0
