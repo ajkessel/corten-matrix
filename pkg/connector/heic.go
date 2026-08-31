@@ -542,7 +542,7 @@ func injectMetadataIntoJPEG(jpegData []byte, meta heicMetadata, log *zerolog.Log
 	}
 	if meta.icc != nil {
 		numChunks := (len(meta.icc) + maxICCChunkData - 1) / maxICCChunkData
-		extra += numChunks * (2 + 2 + 14) + len(meta.icc) // markers + headers + data
+		extra += numChunks*(2+2+14) + len(meta.icc) // markers + headers + data
 	}
 
 	var buf bytes.Buffer
@@ -561,12 +561,12 @@ func injectMetadataIntoJPEG(jpegData []byte, meta heicMetadata, log *zerolog.Log
 			log.Warn().Int("exif_bytes", len(meta.exif)).
 				Msg("EXIF data too large for JPEG APP1 segment, dropping EXIF")
 		} else {
-			buf.Write([]byte{0xFF, 0xE1})                             // APP1 marker
-			lenBytes := make([]byte, 2)                               //nolint:mnd
-			binary.BigEndian.PutUint16(lenBytes, uint16(app1Len))     //nolint:gosec
-			buf.Write(lenBytes)                                       // length
-			buf.Write(exifHeader)                                     // "Exif\0\0"
-			buf.Write(meta.exif)                                      // raw TIFF data
+			buf.Write([]byte{0xFF, 0xE1})                         // APP1 marker
+			lenBytes := make([]byte, 2)                           //nolint:mnd
+			binary.BigEndian.PutUint16(lenBytes, uint16(app1Len)) //nolint:gosec
+			buf.Write(lenBytes)                                   // length
+			buf.Write(exifHeader)                                 // "Exif\0\0"
+			buf.Write(meta.exif)                                  // raw TIFF data
 		}
 	}
 
@@ -580,12 +580,12 @@ func injectMetadataIntoJPEG(jpegData []byte, meta heicMetadata, log *zerolog.Log
 			log.Warn().Int("xmp_bytes", len(meta.xmp)).
 				Msg("XMP data too large for JPEG APP1 segment, dropping XMP")
 		} else {
-			buf.Write([]byte{0xFF, 0xE1})                             // APP1 marker
-			lenBytes := make([]byte, 2)                               //nolint:mnd
-			binary.BigEndian.PutUint16(lenBytes, uint16(app1Len))     //nolint:gosec
-			buf.Write(lenBytes)                                       // length
-			buf.Write(xmpHeader)                                      // XMP namespace
-			buf.Write(meta.xmp)                                       // XMP payload
+			buf.Write([]byte{0xFF, 0xE1})                         // APP1 marker
+			lenBytes := make([]byte, 2)                           //nolint:mnd
+			binary.BigEndian.PutUint16(lenBytes, uint16(app1Len)) //nolint:gosec
+			buf.Write(lenBytes)                                   // length
+			buf.Write(xmpHeader)                                  // XMP namespace
+			buf.Write(meta.xmp)                                   // XMP payload
 		}
 	}
 
@@ -608,14 +608,14 @@ func injectMetadataIntoJPEG(jpegData []byte, meta heicMetadata, log *zerolog.Log
 				// Length = 2 (self) + 12 (signature) + 1 (chunk#) + 1 (total) + data
 				segLen := 2 + len(iccSignature) + 2 + len(chunkData)
 
-				buf.Write([]byte{0xFF, 0xE2})                             // APP2 marker
-				lenBytes := make([]byte, 2)                               //nolint:mnd
-				binary.BigEndian.PutUint16(lenBytes, uint16(segLen))       //nolint:gosec
-				buf.Write(lenBytes)                                       // length
-				buf.Write(iccSignature)                                   // "ICC_PROFILE\0"
-				buf.WriteByte(byte(chunk + 1))                            // 1-based chunk number
-				buf.WriteByte(byte(totalChunks))                          // total chunks
-				buf.Write(chunkData)                                      // profile data
+				buf.Write([]byte{0xFF, 0xE2})                        // APP2 marker
+				lenBytes := make([]byte, 2)                          //nolint:mnd
+				binary.BigEndian.PutUint16(lenBytes, uint16(segLen)) //nolint:gosec
+				buf.Write(lenBytes)                                  // length
+				buf.Write(iccSignature)                              // "ICC_PROFILE\0"
+				buf.WriteByte(byte(chunk + 1))                       // 1-based chunk number
+				buf.WriteByte(byte(totalChunks))                     // total chunks
+				buf.Write(chunkData)                                 // profile data
 			}
 		}
 	}
